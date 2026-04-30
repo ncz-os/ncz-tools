@@ -138,6 +138,8 @@ impl Render for AgentStatusReport {
 const NCZ_OWNERSHIP_LABEL_KEY: &str = "nclawzero";
 const NCZ_OWNERSHIP_LABEL_VALUE: &str = "true";
 const NCZ_OWNERSHIP_LABEL: &str = "nclawzero=true";
+const NCZ_AGENT_LABEL_KEY: &str = "nclawzero.agent";
+const NCZ_MANAGED_HEADER: &str = "# ncz: managed (do not edit)";
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct AgentStatusEntry {
@@ -788,7 +790,12 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
                 "podman volume create --label {NCZ_OWNERSHIP_LABEL}: {agent_count} volume(s)"
             ));
             steps.push(format!(
-                "render quadlets: {agent_count} unit(s) into /etc/containers/systemd/ with Label={NCZ_OWNERSHIP_LABEL}"
+                "render quadlets: {agent_count} unit(s) into /etc/containers/systemd/ with \
+                 {NCZ_MANAGED_HEADER} header and Label={NCZ_OWNERSHIP_LABEL}"
+            ));
+            steps.push(format!(
+                "systemd unit drop-ins/overrides: include {NCZ_MANAGED_HEADER} marker in \
+                 generated content"
             ));
             steps.push("systemctl daemon-reload + enable units (per F-2)".to_string());
         }
@@ -800,7 +807,9 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
                 "docker volume create --label {NCZ_OWNERSHIP_LABEL}: {agent_count} volume(s)"
             ));
             steps.push(format!(
-                "docker run: {agent_count} container(s) with --label {NCZ_OWNERSHIP_LABEL} and --restart=unless-stopped (no systemd)"
+                "docker run: {agent_count} container(s) with --label {NCZ_OWNERSHIP_LABEL}, \
+                 --label {NCZ_AGENT_LABEL_KEY}=<agent-slug>, and --restart=unless-stopped \
+                 (no systemd)"
             ));
         }
     }
@@ -880,7 +889,7 @@ fn cleanup_uninstall_artifacts(
                     paths,
                     target.agent,
                     MissingToolBehavior::Fail,
-                    VolumeDeletionPolicy::MetadataOwned,
+                    ArtifactOwnershipPolicy::MetadataOwned,
                     steps,
                     &mut failures,
                 );
@@ -890,7 +899,7 @@ fn cleanup_uninstall_artifacts(
                     ctx,
                     target.agent,
                     MissingToolBehavior::Fail,
-                    VolumeDeletionPolicy::MetadataOwned,
+                    ArtifactOwnershipPolicy::MetadataOwned,
                     steps,
                     &mut failures,
                 );
@@ -901,7 +910,7 @@ fn cleanup_uninstall_artifacts(
                     paths,
                     target.agent,
                     MissingToolBehavior::NotFound,
-                    VolumeDeletionPolicy::RequireNczLabel {
+                    ArtifactOwnershipPolicy::RequireNczOwnership {
                         destructive_recovery,
                     },
                     steps,
@@ -911,7 +920,7 @@ fn cleanup_uninstall_artifacts(
                     ctx,
                     target.agent,
                     MissingToolBehavior::NotFound,
-                    VolumeDeletionPolicy::RequireNczLabel {
+                    ArtifactOwnershipPolicy::RequireNczOwnership {
                         destructive_recovery,
                     },
                     steps,
@@ -939,29 +948,50 @@ fn cleanup_podman_artifacts(
     paths: &Paths,
     agent: Agent,
     missing_tool_behavior: MissingToolBehavior,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
     let unit = service_name(agent);
     let slug = agent.slug();
     let volume = volume_name(agent);
+    let quadlet = paths.agent_quadlet(slug);
+    let quadlet_marker = match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => ManagedHeaderProbe::NotFound,
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery: true,
+        } => ManagedHeaderProbe::NotFound,
+        ArtifactOwnershipPolicy::RequireNczOwnership { .. } => inspect_managed_header(&quadlet),
+    };
 
     match probe_command(ctx, "systemctl", &["cat", &unit], missing_tool_behavior) {
-        CleanupProbe::Found => {
-            record_cleanup_step(
+        CleanupProbe::Found => match require_managed_header_for_fallback(
+            &unit,
+            &quadlet,
+            &quadlet_marker,
+            ownership_policy,
+        ) {
+            Ok(()) => {
+                record_cleanup_step(
+                    steps,
+                    failures,
+                    format!("podman service cleanup: {unit}"),
+                    cleanup_command(ctx, "sudo", &["systemctl", "stop", &unit]),
+                );
+                record_cleanup_step(
+                    steps,
+                    failures,
+                    format!("podman service disable: {unit}"),
+                    cleanup_command(ctx, "sudo", &["systemctl", "disable", &unit]),
+                );
+            }
+            Err(outcome) => record_cleanup_step(
                 steps,
                 failures,
                 format!("podman service cleanup: {unit}"),
-                cleanup_command(ctx, "sudo", &["systemctl", "stop", &unit]),
-            );
-            record_cleanup_step(
-                steps,
-                failures,
-                format!("podman service disable: {unit}"),
-                cleanup_command(ctx, "sudo", &["systemctl", "disable", &unit]),
-            );
-        }
+                outcome,
+            ),
+        },
         CleanupProbe::NotFound => record_cleanup_step(
             steps,
             failures,
@@ -976,8 +1006,7 @@ fn cleanup_podman_artifacts(
         ),
     }
 
-    let quadlet = paths.agent_quadlet(slug);
-    match remove_path_if_present(&quadlet) {
+    match cleanup_managed_quadlet(&quadlet, &quadlet_marker, ownership_policy) {
         CleanupOutcome::Removed => {
             record_cleanup_step(
                 steps,
@@ -1000,31 +1029,12 @@ fn cleanup_podman_artifacts(
         ),
     }
 
-    match probe_command(
-        ctx,
-        "podman",
-        &["container", "exists", slug],
-        missing_tool_behavior,
-    ) {
-        CleanupProbe::Found => record_cleanup_step(
-            steps,
-            failures,
-            format!("podman container cleanup: {slug}"),
-            cleanup_command(ctx, "podman", &["rm", "-f", slug]),
-        ),
-        CleanupProbe::NotFound => record_cleanup_step(
-            steps,
-            failures,
-            format!("podman container cleanup: {slug}"),
-            CleanupOutcome::NotFound,
-        ),
-        CleanupProbe::Failed { reason } => record_cleanup_step(
-            steps,
-            failures,
-            format!("podman container cleanup: {slug}"),
-            probe_failed_outcome(reason),
-        ),
-    }
+    record_cleanup_step(
+        steps,
+        failures,
+        format!("podman container cleanup: {slug}"),
+        cleanup_podman_container(ctx, slug, missing_tool_behavior, ownership_policy),
+    );
 
     match probe_command(
         ctx,
@@ -1036,7 +1046,7 @@ fn cleanup_podman_artifacts(
             steps,
             failures,
             format!("podman volume cleanup: {volume}"),
-            cleanup_podman_volume(ctx, &volume, volume_policy),
+            cleanup_podman_volume(ctx, &volume, ownership_policy),
         ),
         CleanupProbe::NotFound => record_cleanup_step(
             steps,
@@ -1057,44 +1067,25 @@ fn cleanup_docker_artifacts(
     ctx: &Context,
     agent: Agent,
     missing_tool_behavior: MissingToolBehavior,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
     let container = docker_container_name(agent);
     let volume = volume_name(agent);
 
-    match probe_command(
-        ctx,
-        "docker",
-        &["container", "inspect", &container],
-        missing_tool_behavior,
-    ) {
-        CleanupProbe::Found => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker container cleanup: {container}"),
-            cleanup_command(ctx, "docker", &["rm", "-f", &container]),
-        ),
-        CleanupProbe::NotFound => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker container cleanup: {container}"),
-            CleanupOutcome::NotFound,
-        ),
-        CleanupProbe::Failed { reason } => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker container cleanup: {container}"),
-            probe_failed_outcome(reason),
-        ),
-    }
+    record_cleanup_step(
+        steps,
+        failures,
+        format!("docker container cleanup: {container}"),
+        cleanup_docker_container(ctx, &container, missing_tool_behavior, ownership_policy),
+    );
 
     record_cleanup_step(
         steps,
         failures,
         format!("docker volume cleanup: {volume}"),
-        cleanup_docker_volume(ctx, &volume, missing_tool_behavior, volume_policy),
+        cleanup_docker_volume(ctx, &volume, missing_tool_behavior, ownership_policy),
     );
 }
 
@@ -1144,9 +1135,9 @@ enum MissingToolBehavior {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolumeDeletionPolicy {
+enum ArtifactOwnershipPolicy {
     MetadataOwned,
-    RequireNczLabel { destructive_recovery: bool },
+    RequireNczOwnership { destructive_recovery: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1155,22 +1146,257 @@ struct CleanupFailure {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedHeaderProbe {
+    Found { managed: bool },
+    NotFound,
+    Failed { reason: String },
+}
+
+fn inspect_managed_header(path: &std::path::Path) -> ManagedHeaderProbe {
+    match fs::read_to_string(path) {
+        Ok(body) => ManagedHeaderProbe::Found {
+            managed: body_has_managed_header(&body),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ManagedHeaderProbe::NotFound,
+        Err(err) => ManagedHeaderProbe::Failed {
+            reason: err.to_string(),
+        },
+    }
+}
+
+fn body_has_managed_header(body: &str) -> bool {
+    body.lines().any(|line| line.trim() == NCZ_MANAGED_HEADER)
+}
+
+fn require_managed_header_for_fallback(
+    artifact: &str,
+    path: &std::path::Path,
+    marker: &ManagedHeaderProbe,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> Result<(), CleanupOutcome> {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => Ok(()),
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery,
+        } => {
+            if destructive_recovery {
+                return Ok(());
+            }
+            match marker {
+                ManagedHeaderProbe::Found { managed: true } => Ok(()),
+                ManagedHeaderProbe::Found { managed: false } => Err(CleanupOutcome::Failed {
+                    reason: ambiguous_unmanaged_artifact_message(artifact, path),
+                }),
+                ManagedHeaderProbe::NotFound => Err(CleanupOutcome::Failed {
+                    reason: ambiguous_missing_managed_header_message(artifact, path),
+                }),
+                ManagedHeaderProbe::Failed { reason } => Err(probe_failed_outcome(reason.clone())),
+            }
+        }
+    }
+}
+
+fn cleanup_managed_quadlet(
+    path: &std::path::Path,
+    marker: &ManagedHeaderProbe,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> CleanupOutcome {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => remove_path_if_present(path),
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery,
+        } => {
+            if destructive_recovery {
+                return remove_path_if_present(path);
+            }
+            match marker {
+                ManagedHeaderProbe::Found { managed: true } => remove_path_if_present(path),
+                ManagedHeaderProbe::Found { managed: false } => CleanupOutcome::Failed {
+                    reason: ambiguous_unmanaged_artifact_message(&path.display().to_string(), path),
+                },
+                ManagedHeaderProbe::NotFound => CleanupOutcome::NotFound,
+                ManagedHeaderProbe::Failed { reason } => probe_failed_outcome(reason.clone()),
+            }
+        }
+    }
+}
+
+fn cleanup_podman_container(
+    ctx: &Context,
+    container: &str,
+    missing_tool_behavior: MissingToolBehavior,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> CleanupOutcome {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => match probe_command(
+            ctx,
+            "podman",
+            &["container", "exists", container],
+            missing_tool_behavior,
+        ) {
+            CleanupProbe::Found => cleanup_command(ctx, "podman", &["rm", "-f", container]),
+            CleanupProbe::NotFound => CleanupOutcome::NotFound,
+            CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
+        },
+        ArtifactOwnershipPolicy::RequireNczOwnership { .. } => cleanup_inspected_container(
+            ctx,
+            "podman",
+            container,
+            missing_tool_behavior,
+            ownership_policy,
+        ),
+    }
+}
+
+fn cleanup_docker_container(
+    ctx: &Context,
+    container: &str,
+    missing_tool_behavior: MissingToolBehavior,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> CleanupOutcome {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => match probe_command(
+            ctx,
+            "docker",
+            &["container", "inspect", container],
+            missing_tool_behavior,
+        ) {
+            CleanupProbe::Found => cleanup_command(ctx, "docker", &["rm", "-f", container]),
+            CleanupProbe::NotFound => CleanupOutcome::NotFound,
+            CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
+        },
+        ArtifactOwnershipPolicy::RequireNczOwnership { .. } => cleanup_inspected_container(
+            ctx,
+            "docker",
+            container,
+            missing_tool_behavior,
+            ownership_policy,
+        ),
+    }
+}
+
+fn cleanup_inspected_container(
+    ctx: &Context,
+    runtime_cmd: &str,
+    container: &str,
+    missing_tool_behavior: MissingToolBehavior,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> CleanupOutcome {
+    if matches!(
+        ownership_policy,
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery: true
+        }
+    ) {
+        let args = ["container", "inspect", container];
+        return match probe_command(ctx, runtime_cmd, &args, missing_tool_behavior) {
+            CleanupProbe::Found => cleanup_command(ctx, runtime_cmd, &["rm", "-f", container]),
+            CleanupProbe::NotFound => CleanupOutcome::NotFound,
+            CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
+        };
+    }
+
+    match inspect_container_for_ownership(ctx, runtime_cmd, container, missing_tool_behavior) {
+        ContainerInspectProbe::Found { ncz_labeled } => cleanup_inspected_container_after_probe(
+            ctx,
+            runtime_cmd,
+            container,
+            ncz_labeled,
+            ownership_policy,
+        ),
+        ContainerInspectProbe::NotFound => CleanupOutcome::NotFound,
+        ContainerInspectProbe::Failed { reason } => probe_failed_outcome(reason),
+    }
+}
+
+fn cleanup_inspected_container_after_probe(
+    ctx: &Context,
+    runtime_cmd: &str,
+    container: &str,
+    ncz_labeled: bool,
+    ownership_policy: ArtifactOwnershipPolicy,
+) -> CleanupOutcome {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => {
+            cleanup_command(ctx, runtime_cmd, &["rm", "-f", container])
+        }
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery,
+        } => {
+            if ncz_labeled || destructive_recovery {
+                cleanup_command(ctx, runtime_cmd, &["rm", "-f", container])
+            } else {
+                CleanupOutcome::Failed {
+                    reason: ambiguous_unlabeled_artifact_message(container),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContainerInspectProbe {
+    Found { ncz_labeled: bool },
+    NotFound,
+    Failed { reason: String },
+}
+
+fn inspect_container_for_ownership(
+    ctx: &Context,
+    runtime_cmd: &str,
+    container: &str,
+    missing_tool_behavior: MissingToolBehavior,
+) -> ContainerInspectProbe {
+    let args = ["container", "inspect", container];
+    match ctx.runner.run(runtime_cmd, &args) {
+        Ok(out) if out.ok() => match inspect_stdout_has_ncz_label(&out.stdout, "container") {
+            Ok(ncz_labeled) => ContainerInspectProbe::Found { ncz_labeled },
+            Err(reason) => ContainerInspectProbe::Failed { reason },
+        },
+        Ok(out) => {
+            let missing_tool = missing_tool_behavior == MissingToolBehavior::NotFound
+                && probe_output_is_missing_tool(runtime_cmd, out.status, &out.stdout, &out.stderr);
+            let not_found =
+                probe_output_is_not_found(runtime_cmd, &args, out.status, &out.stdout, &out.stderr);
+            if missing_tool || not_found {
+                ContainerInspectProbe::NotFound
+            } else {
+                ContainerInspectProbe::Failed {
+                    reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
+                }
+            }
+        }
+        Err(err) => {
+            if missing_tool_behavior == MissingToolBehavior::NotFound
+                && command_error_is_missing_tool(&err, runtime_cmd)
+            {
+                ContainerInspectProbe::NotFound
+            } else {
+                ContainerInspectProbe::Failed {
+                    reason: err.to_string(),
+                }
+            }
+        }
+    }
+}
+
 fn cleanup_podman_volume(
     ctx: &Context,
     volume: &str,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
 ) -> CleanupOutcome {
-    cleanup_existing_volume(ctx, "podman", volume, volume_policy)
+    cleanup_existing_volume(ctx, "podman", volume, ownership_policy)
 }
 
 fn cleanup_docker_volume(
     ctx: &Context,
     volume: &str,
     missing_tool_behavior: MissingToolBehavior,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
 ) -> CleanupOutcome {
-    match volume_policy {
-        VolumeDeletionPolicy::MetadataOwned => match probe_command(
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => match probe_command(
             ctx,
             "docker",
             &["volume", "inspect", volume],
@@ -1180,10 +1406,22 @@ fn cleanup_docker_volume(
             CleanupProbe::NotFound => CleanupOutcome::NotFound,
             CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
         },
-        VolumeDeletionPolicy::RequireNczLabel { .. } => {
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery: true,
+        } => match probe_command(
+            ctx,
+            "docker",
+            &["volume", "inspect", volume],
+            missing_tool_behavior,
+        ) {
+            CleanupProbe::Found => cleanup_command(ctx, "docker", &["volume", "rm", "-f", volume]),
+            CleanupProbe::NotFound => CleanupOutcome::NotFound,
+            CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
+        },
+        ArtifactOwnershipPolicy::RequireNczOwnership { .. } => {
             match inspect_volume_for_ownership(ctx, "docker", volume, missing_tool_behavior) {
                 VolumeInspectProbe::Found { ncz_labeled } => {
-                    cleanup_inspected_volume(ctx, "docker", volume, ncz_labeled, volume_policy)
+                    cleanup_inspected_volume(ctx, "docker", volume, ncz_labeled, ownership_policy)
                 }
                 VolumeInspectProbe::NotFound => CleanupOutcome::NotFound,
                 VolumeInspectProbe::Failed { reason } => probe_failed_outcome(reason),
@@ -1196,18 +1434,25 @@ fn cleanup_existing_volume(
     ctx: &Context,
     runtime_cmd: &str,
     volume: &str,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
 ) -> CleanupOutcome {
-    match volume_policy {
-        VolumeDeletionPolicy::MetadataOwned => {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => {
             cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume])
         }
-        VolumeDeletionPolicy::RequireNczLabel { .. } => {
+        ArtifactOwnershipPolicy::RequireNczOwnership {
+            destructive_recovery: true,
+        } => cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume]),
+        ArtifactOwnershipPolicy::RequireNczOwnership { .. } => {
             match inspect_volume_for_ownership(ctx, runtime_cmd, volume, MissingToolBehavior::Fail)
             {
-                VolumeInspectProbe::Found { ncz_labeled } => {
-                    cleanup_inspected_volume(ctx, runtime_cmd, volume, ncz_labeled, volume_policy)
-                }
+                VolumeInspectProbe::Found { ncz_labeled } => cleanup_inspected_volume(
+                    ctx,
+                    runtime_cmd,
+                    volume,
+                    ncz_labeled,
+                    ownership_policy,
+                ),
                 VolumeInspectProbe::NotFound => CleanupOutcome::NotFound,
                 VolumeInspectProbe::Failed { reason } => probe_failed_outcome(reason),
             }
@@ -1220,13 +1465,13 @@ fn cleanup_inspected_volume(
     runtime_cmd: &str,
     volume: &str,
     ncz_labeled: bool,
-    volume_policy: VolumeDeletionPolicy,
+    ownership_policy: ArtifactOwnershipPolicy,
 ) -> CleanupOutcome {
-    match volume_policy {
-        VolumeDeletionPolicy::MetadataOwned => {
+    match ownership_policy {
+        ArtifactOwnershipPolicy::MetadataOwned => {
             cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume])
         }
-        VolumeDeletionPolicy::RequireNczLabel {
+        ArtifactOwnershipPolicy::RequireNczOwnership {
             destructive_recovery,
         } => {
             if ncz_labeled || destructive_recovery {
@@ -1255,7 +1500,7 @@ fn inspect_volume_for_ownership(
 ) -> VolumeInspectProbe {
     let args = ["volume", "inspect", volume];
     match ctx.runner.run(runtime_cmd, &args) {
-        Ok(out) if out.ok() => match inspect_stdout_has_ncz_label(&out.stdout) {
+        Ok(out) if out.ok() => match inspect_stdout_has_ncz_label(&out.stdout, "volume") {
             Ok(ncz_labeled) => VolumeInspectProbe::Found { ncz_labeled },
             Err(reason) => VolumeInspectProbe::Failed { reason },
         },
@@ -1286,21 +1531,47 @@ fn inspect_volume_for_ownership(
     }
 }
 
-fn inspect_stdout_has_ncz_label(stdout: &str) -> Result<bool, String> {
+fn inspect_stdout_has_ncz_label(stdout: &str, artifact_kind: &str) -> Result<bool, String> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|err| {
-        format!("could not parse volume inspect labels for {NCZ_OWNERSHIP_LABEL}: {err}")
+        format!("could not parse {artifact_kind} inspect labels for {NCZ_OWNERSHIP_LABEL}: {err}")
     })?;
-    Ok(volume_inspect_value_has_ncz_label(&value))
+    Ok(inspect_value_has_ncz_label(&value))
 }
 
-fn volume_inspect_value_has_ncz_label(value: &serde_json::Value) -> bool {
-    let Some(object) = first_volume_inspect_object(value) else {
+fn inspect_value_has_ncz_label(value: &serde_json::Value) -> bool {
+    let Some(object) = first_inspect_object(value) else {
         return false;
     };
-    let labels = object.get("Labels").or_else(|| object.get("labels"));
-    let Some(labels) = labels.and_then(serde_json::Value::as_object) else {
-        return false;
-    };
+    object_has_ncz_label(object)
+}
+
+fn object_has_ncz_label(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    for key in ["Labels", "labels"] {
+        if let Some(labels) = object.get(key).and_then(serde_json::Value::as_object) {
+            if labels_have_ncz_ownership(labels) {
+                return true;
+            }
+        }
+    }
+    for parent_key in ["Config", "config"] {
+        let Some(parent) = object
+            .get(parent_key)
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for key in ["Labels", "labels"] {
+            if let Some(labels) = parent.get(key).and_then(serde_json::Value::as_object) {
+                if labels_have_ncz_ownership(labels) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn labels_have_ncz_ownership(labels: &serde_json::Map<String, serde_json::Value>) -> bool {
     match labels.get(NCZ_OWNERSHIP_LABEL_KEY) {
         Some(serde_json::Value::String(value)) => value == NCZ_OWNERSHIP_LABEL_VALUE,
         Some(serde_json::Value::Bool(value)) => *value,
@@ -1308,7 +1579,7 @@ fn volume_inspect_value_has_ncz_label(value: &serde_json::Value) -> bool {
     }
 }
 
-fn first_volume_inspect_object(
+fn first_inspect_object(
     value: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
     if let Some(array) = value.as_array() {
@@ -1319,7 +1590,24 @@ fn first_volume_inspect_object(
 
 fn ambiguous_unlabeled_artifact_message(name: &str) -> String {
     format!(
-        "ambiguous artifact {name} not labeled {NCZ_OWNERSHIP_LABEL}; not deleting. Re-run with --destructive-recovery to force delete."
+        "ambiguous artifact {name} not labeled {NCZ_OWNERSHIP_LABEL}; not deleting. \
+         Re-run with --destructive-recovery to force delete."
+    )
+}
+
+fn ambiguous_unmanaged_artifact_message(name: &str, path: &std::path::Path) -> String {
+    format!(
+        "ambiguous artifact {name} missing managed header {NCZ_MANAGED_HEADER} in {}; \
+         not deleting or stopping. Re-run with --destructive-recovery to force delete.",
+        path.display()
+    )
+}
+
+fn ambiguous_missing_managed_header_message(name: &str, path: &std::path::Path) -> String {
+    format!(
+        "ambiguous artifact {name} has no managed header proof because {} was not found; \
+         not deleting or stopping. Re-run with --destructive-recovery to force delete.",
+        path.display()
     )
 }
 
@@ -1377,14 +1665,26 @@ fn probe_output_is_not_found(
     stdout: &str,
     stderr: &str,
 ) -> bool {
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    let missing_tool = probe_output_is_missing_tool(cmd, status, stdout, stderr);
+    if matches!(
+        (cmd, args),
+        ("podman", ["container", "inspect", _]) | ("podman", ["volume", "inspect", _])
+    ) && !missing_tool
+        && (output.contains("not found")
+            || output.contains("no such")
+            || output.contains("no container")
+            || output.contains("no volume"))
+    {
+        return true;
+    }
     if status == 125 {
         return false;
     }
-    if probe_output_is_missing_tool(cmd, status, stdout, stderr) {
+    if missing_tool {
         return false;
     }
 
-    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     if output.contains("permission denied")
         || output.contains("cannot connect")
         || output.contains("connection refused")
@@ -1401,6 +1701,9 @@ fn probe_output_is_not_found(
                 || output.contains("no such")
         }
         ("podman", ["container", "exists", _]) | ("podman", ["volume", "exists", _]) => status == 1,
+        ("podman", ["container", "inspect", _]) | ("podman", ["volume", "inspect", _]) => {
+            output.contains("not found") || output.contains("no such")
+        }
         ("docker", ["container", "inspect", _]) | ("docker", ["volume", "inspect", _]) => {
             output.contains("not found") || output.contains("no such")
         }
@@ -1923,7 +2226,7 @@ mod tests {
         );
         runner.expect(
             "podman",
-            &["container", "exists", agent.slug()],
+            &["container", "inspect", agent.slug()],
             out(127, "", "podman: command not found\n"),
         );
         runner.expect(
@@ -1940,8 +2243,8 @@ mod tests {
         runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
         runner.expect(
             "podman",
-            &["container", "exists", agent.slug()],
-            out(1, "", ""),
+            &["container", "inspect", agent.slug()],
+            out(1, "", "not found\n"),
         );
         runner.expect("podman", &["volume", "exists", &volume], out(1, "", ""));
     }
@@ -1969,6 +2272,21 @@ mod tests {
         r#"[{"Labels":{}}]"#
     }
 
+    fn labeled_container_inspect_json(agent: Agent) -> String {
+        format!(
+            r#"[{{"Config":{{"Labels":{{"nclawzero":"true","nclawzero.agent":"{}"}}}}}}]"#,
+            agent.slug()
+        )
+    }
+
+    fn unlabeled_container_inspect_json() -> &'static str {
+        r#"[{"Config":{"Labels":{}}}]"#
+    }
+
+    fn unmanaged_quadlet_body() -> &'static str {
+        "[Container]\nImage=localhost/hermes:latest\n"
+    }
+
     fn expect_podman_fallback_volume_cleanup(
         runner: &FakeRunner,
         agent: Agent,
@@ -1980,8 +2298,8 @@ mod tests {
         runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
         runner.expect(
             "podman",
-            &["container", "exists", agent.slug()],
-            out(1, "", ""),
+            &["container", "inspect", agent.slug()],
+            out(1, "", "not found\n"),
         );
         runner.expect("podman", &["volume", "exists", &volume], out(0, "", ""));
         runner.expect(
@@ -1992,6 +2310,19 @@ mod tests {
         if expect_remove {
             runner.expect("podman", &["volume", "rm", "-f", &volume], out(0, "", ""));
         }
+    }
+
+    fn expect_podman_destructive_volume_cleanup(runner: &FakeRunner, agent: Agent) {
+        let unit = service_name(agent);
+        let volume = volume_name(agent);
+        runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
+        runner.expect(
+            "podman",
+            &["container", "inspect", agent.slug()],
+            out(1, "", "not found\n"),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(0, "", ""));
+        runner.expect("podman", &["volume", "rm", "-f", &volume], out(0, "", ""));
     }
 
     fn expect_docker_fallback_volume_cleanup(
@@ -2157,7 +2488,12 @@ mod tests {
         assert!(steps
             .iter()
             .any(|step| step.contains("/etc/containers/systemd/")
+                && step.contains("# ncz: managed (do not edit)")
                 && step.contains("Label=nclawzero=true")));
+        assert!(steps.iter().any(|step| {
+            step.starts_with("systemd unit drop-ins/overrides:")
+                && step.contains("# ncz: managed (do not edit)")
+        }));
         assert!(steps
             .iter()
             .any(|step| step.starts_with("systemctl daemon-reload")));
@@ -2184,6 +2520,7 @@ mod tests {
         assert!(steps.iter().any(|step| {
             step.starts_with("docker run:")
                 && step.contains("--label nclawzero=true")
+                && step.contains("--label nclawzero.agent=<agent-slug>")
                 && step.contains("--restart=unless-stopped")
                 && step.contains("no systemd")
         }));
@@ -2528,6 +2865,197 @@ mod tests {
     }
 
     #[test]
+    fn metadata_less_uninstall_refuses_unlabeled_fallback_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        let unit = service_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
+        runner.expect(
+            "podman",
+            &["container", "inspect", Agent::Hermes.slug()],
+            out(0, unlabeled_container_inspect_json(), ""),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(1, "", ""));
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("ambiguous artifact hermes not labeled nclawzero=true; not deleting")
+                    && message.contains("metadata preserved for retry")
+        ));
+        assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn metadata_less_uninstall_refuses_unmanaged_fallback_service_and_quadlet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        std::fs::create_dir_all(&paths.quadlet_dir).unwrap();
+        std::fs::write(
+            paths.agent_quadlet(Agent::Hermes.slug()),
+            unmanaged_quadlet_body(),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        let unit = service_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        runner.expect("systemctl", &["cat", &unit], out(0, "unit\n", ""));
+        runner.expect(
+            "podman",
+            &["container", "inspect", Agent::Hermes.slug()],
+            out(1, "", "not found\n"),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(1, "", ""));
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("podman service cleanup: hermes.service")
+                    && message.contains("missing managed header # ncz: managed (do not edit)")
+                    && message.contains("metadata preserved for retry")
+        ));
+        assert!(paths.agent_quadlet(Agent::Hermes.slug()).exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn metadata_less_uninstall_refuses_labeled_container_with_unmanaged_quadlet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        std::fs::create_dir_all(&paths.quadlet_dir).unwrap();
+        std::fs::write(
+            paths.agent_quadlet(Agent::Hermes.slug()),
+            unmanaged_quadlet_body(),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        let unit = service_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        let labels = labeled_container_inspect_json(Agent::Hermes);
+        runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
+        runner.expect(
+            "podman",
+            &["container", "inspect", Agent::Hermes.slug()],
+            out(0, &labels, ""),
+        );
+        runner.expect(
+            "podman",
+            &["rm", "-f", Agent::Hermes.slug()],
+            out(0, "", ""),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(1, "", ""));
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("podman quadlet cleanup")
+                    && message.contains("ambiguous artifact")
+                    && message.contains("missing managed header # ncz: managed (do not edit)")
+        ));
+        assert!(paths.agent_quadlet(Agent::Hermes.slug()).exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn metadata_less_destructive_recovery_overrides_container_service_quadlet_and_volume_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        std::fs::create_dir_all(&paths.quadlet_dir).unwrap();
+        std::fs::write(
+            paths.agent_quadlet(Agent::Hermes.slug()),
+            unmanaged_quadlet_body(),
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        let unit = service_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        runner.expect("systemctl", &["cat", &unit], out(0, "unit\n", ""));
+        runner.expect("sudo", &["systemctl", "stop", &unit], out(0, "", ""));
+        runner.expect("sudo", &["systemctl", "disable", &unit], out(0, "", ""));
+        runner.expect("sudo", &["systemctl", "daemon-reload"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &["container", "inspect", Agent::Hermes.slug()],
+            out(0, unlabeled_container_inspect_json(), ""),
+        );
+        runner.expect(
+            "podman",
+            &["rm", "-f", Agent::Hermes.slug()],
+            out(0, "", ""),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(0, "", ""));
+        runner.expect("podman", &["volume", "rm", "-f", &volume], out(0, "", ""));
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let report = uninstall_report(report);
+
+        assert!(report.applied);
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman service cleanup: hermes.service removed")));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman quadlet cleanup") && step.contains("removed")));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman container cleanup: hermes removed")));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman volume cleanup: hermes-data removed")));
+        assert!(!paths.agent_quadlet(Agent::Hermes.slug()).exists());
+        runner.assert_done();
+    }
+
+    #[test]
     fn metadata_less_uninstall_removes_labeled_fallback_volume() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -2569,12 +3097,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
-        expect_podman_fallback_volume_cleanup(
-            &runner,
-            Agent::Hermes,
-            unlabeled_volume_inspect_json(),
-            true,
-        );
+        expect_podman_destructive_volume_cleanup(&runner, Agent::Hermes);
         expect_docker_fallback_volume_cleanup(
             &runner,
             Agent::Hermes,
