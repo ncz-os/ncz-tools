@@ -398,7 +398,10 @@ pub enum AgentAction {
     /// containers and volumes, agent-images. Idempotent.
     #[non_exhaustive]
     Uninstall {
-        /// Agent name; omit to uninstall all.
+        /// Uninstall all agents. Equivalent to omitting the agent name.
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
+        /// Agent name; omit or pass --all to uninstall all.
         agent: Option<AgentName>,
         /// Also remove `/etc/nclawzero/agent-env` and provider data dirs.
         /// Default leaves them for re-install.
@@ -451,12 +454,27 @@ mod tests {
         let Command::Agent {
             action:
                 AgentAction::Uninstall {
+                    all: false,
                     agent: None,
                     full: false,
                 },
         } = uninstall.command
         else {
             panic!("expected agent uninstall all");
+        };
+
+        let uninstall =
+            Cli::try_parse_from(["ncz", "agent", "uninstall", "--all", "--full"]).unwrap();
+        let Command::Agent {
+            action:
+                AgentAction::Uninstall {
+                    all: true,
+                    agent: None,
+                    full: true,
+                },
+        } = uninstall.command
+        else {
+            panic!("expected explicit agent uninstall all");
         };
     }
 
