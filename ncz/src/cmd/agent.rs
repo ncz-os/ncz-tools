@@ -135,6 +135,10 @@ impl Render for AgentStatusReport {
     }
 }
 
+const NCZ_OWNERSHIP_LABEL_KEY: &str = "nclawzero";
+const NCZ_OWNERSHIP_LABEL_VALUE: &str = "true";
+const NCZ_OWNERSHIP_LABEL: &str = "nclawzero=true";
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct AgentStatusEntry {
     pub agent: String,
@@ -379,12 +383,14 @@ pub fn run_with_paths(ctx: &Context, paths: &Paths, action: AgentAction) -> Resu
             agent,
             full,
             force_recover_from_corrupt,
+            destructive_recovery,
         } => uninstall(
             ctx,
             paths,
             AgentSelector::from_uninstall_args(all, agent),
             full,
             force_recover_from_corrupt,
+            destructive_recovery,
         )?,
     };
     let code = match &report {
@@ -530,12 +536,20 @@ fn uninstall(
     selector: AgentSelector,
     full: bool,
     force_recover_from_corrupt: bool,
+    destructive_recovery: bool,
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let plan = uninstall_plan(paths, selector, force_recover_from_corrupt)?;
     reject_unsafe_full_uninstall(full, selector, &plan.metadata)?;
     let mut planned_steps = uninstall_metadata_steps(&plan.metadata);
-    cleanup_uninstall_artifacts(ctx, paths, &plan.targets, full, &mut planned_steps)?;
+    cleanup_uninstall_artifacts(
+        ctx,
+        paths,
+        &plan.targets,
+        full,
+        destructive_recovery,
+        &mut planned_steps,
+    )?;
     remove_uninstall_metadata(
         paths,
         selector,
@@ -771,7 +785,10 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
         ContainerRuntime::Podman => {
             steps.push(format!("podman load: {agent_count} image(s)"));
             steps.push(format!(
-                "render quadlets: {agent_count} unit(s) into /etc/containers/systemd/"
+                "podman volume create --label {NCZ_OWNERSHIP_LABEL}: {agent_count} volume(s)"
+            ));
+            steps.push(format!(
+                "render quadlets: {agent_count} unit(s) into /etc/containers/systemd/ with Label={NCZ_OWNERSHIP_LABEL}"
             ));
             steps.push("systemctl daemon-reload + enable units (per F-2)".to_string());
         }
@@ -780,7 +797,10 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
             // Docker-native: no Podman quadlets and no systemd dependency.
             steps.push(format!("docker load: {agent_count} image(s)"));
             steps.push(format!(
-                "docker run: {agent_count} container(s) with --label nclawzero.agent and --restart=unless-stopped (no systemd)"
+                "docker volume create --label {NCZ_OWNERSHIP_LABEL}: {agent_count} volume(s)"
+            ));
+            steps.push(format!(
+                "docker run: {agent_count} container(s) with --label {NCZ_OWNERSHIP_LABEL} and --restart=unless-stopped (no systemd)"
             ));
         }
     }
@@ -848,6 +868,7 @@ fn cleanup_uninstall_artifacts(
     paths: &Paths,
     targets: &[UninstallTarget],
     full: bool,
+    destructive_recovery: bool,
     steps: &mut Vec<String>,
 ) -> Result<(), NczError> {
     let mut failures = Vec::new();
@@ -859,6 +880,7 @@ fn cleanup_uninstall_artifacts(
                     paths,
                     target.agent,
                     MissingToolBehavior::Fail,
+                    VolumeDeletionPolicy::MetadataOwned,
                     steps,
                     &mut failures,
                 );
@@ -868,6 +890,7 @@ fn cleanup_uninstall_artifacts(
                     ctx,
                     target.agent,
                     MissingToolBehavior::Fail,
+                    VolumeDeletionPolicy::MetadataOwned,
                     steps,
                     &mut failures,
                 );
@@ -878,6 +901,9 @@ fn cleanup_uninstall_artifacts(
                     paths,
                     target.agent,
                     MissingToolBehavior::NotFound,
+                    VolumeDeletionPolicy::RequireNczLabel {
+                        destructive_recovery,
+                    },
                     steps,
                     &mut failures,
                 );
@@ -885,6 +911,9 @@ fn cleanup_uninstall_artifacts(
                     ctx,
                     target.agent,
                     MissingToolBehavior::NotFound,
+                    VolumeDeletionPolicy::RequireNczLabel {
+                        destructive_recovery,
+                    },
                     steps,
                     &mut failures,
                 );
@@ -910,6 +939,7 @@ fn cleanup_podman_artifacts(
     paths: &Paths,
     agent: Agent,
     missing_tool_behavior: MissingToolBehavior,
+    volume_policy: VolumeDeletionPolicy,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
@@ -1006,7 +1036,7 @@ fn cleanup_podman_artifacts(
             steps,
             failures,
             format!("podman volume cleanup: {volume}"),
-            cleanup_command(ctx, "podman", &["volume", "rm", "-f", &volume]),
+            cleanup_podman_volume(ctx, &volume, volume_policy),
         ),
         CleanupProbe::NotFound => record_cleanup_step(
             steps,
@@ -1027,6 +1057,7 @@ fn cleanup_docker_artifacts(
     ctx: &Context,
     agent: Agent,
     missing_tool_behavior: MissingToolBehavior,
+    volume_policy: VolumeDeletionPolicy,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
@@ -1059,31 +1090,12 @@ fn cleanup_docker_artifacts(
         ),
     }
 
-    match probe_command(
-        ctx,
-        "docker",
-        &["volume", "inspect", &volume],
-        missing_tool_behavior,
-    ) {
-        CleanupProbe::Found => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker volume cleanup: {volume}"),
-            cleanup_command(ctx, "docker", &["volume", "rm", "-f", &volume]),
-        ),
-        CleanupProbe::NotFound => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker volume cleanup: {volume}"),
-            CleanupOutcome::NotFound,
-        ),
-        CleanupProbe::Failed { reason } => record_cleanup_step(
-            steps,
-            failures,
-            format!("docker volume cleanup: {volume}"),
-            probe_failed_outcome(reason),
-        ),
-    }
+    record_cleanup_step(
+        steps,
+        failures,
+        format!("docker volume cleanup: {volume}"),
+        cleanup_docker_volume(ctx, &volume, missing_tool_behavior, volume_policy),
+    );
 }
 
 fn cleanup_full_uninstall_paths(
@@ -1131,10 +1143,184 @@ enum MissingToolBehavior {
     NotFound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeDeletionPolicy {
+    MetadataOwned,
+    RequireNczLabel { destructive_recovery: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupFailure {
     step: String,
     reason: String,
+}
+
+fn cleanup_podman_volume(
+    ctx: &Context,
+    volume: &str,
+    volume_policy: VolumeDeletionPolicy,
+) -> CleanupOutcome {
+    cleanup_existing_volume(ctx, "podman", volume, volume_policy)
+}
+
+fn cleanup_docker_volume(
+    ctx: &Context,
+    volume: &str,
+    missing_tool_behavior: MissingToolBehavior,
+    volume_policy: VolumeDeletionPolicy,
+) -> CleanupOutcome {
+    match volume_policy {
+        VolumeDeletionPolicy::MetadataOwned => match probe_command(
+            ctx,
+            "docker",
+            &["volume", "inspect", volume],
+            missing_tool_behavior,
+        ) {
+            CleanupProbe::Found => cleanup_command(ctx, "docker", &["volume", "rm", "-f", volume]),
+            CleanupProbe::NotFound => CleanupOutcome::NotFound,
+            CleanupProbe::Failed { reason } => probe_failed_outcome(reason),
+        },
+        VolumeDeletionPolicy::RequireNczLabel { .. } => {
+            match inspect_volume_for_ownership(ctx, "docker", volume, missing_tool_behavior) {
+                VolumeInspectProbe::Found { ncz_labeled } => {
+                    cleanup_inspected_volume(ctx, "docker", volume, ncz_labeled, volume_policy)
+                }
+                VolumeInspectProbe::NotFound => CleanupOutcome::NotFound,
+                VolumeInspectProbe::Failed { reason } => probe_failed_outcome(reason),
+            }
+        }
+    }
+}
+
+fn cleanup_existing_volume(
+    ctx: &Context,
+    runtime_cmd: &str,
+    volume: &str,
+    volume_policy: VolumeDeletionPolicy,
+) -> CleanupOutcome {
+    match volume_policy {
+        VolumeDeletionPolicy::MetadataOwned => {
+            cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume])
+        }
+        VolumeDeletionPolicy::RequireNczLabel { .. } => {
+            match inspect_volume_for_ownership(ctx, runtime_cmd, volume, MissingToolBehavior::Fail)
+            {
+                VolumeInspectProbe::Found { ncz_labeled } => {
+                    cleanup_inspected_volume(ctx, runtime_cmd, volume, ncz_labeled, volume_policy)
+                }
+                VolumeInspectProbe::NotFound => CleanupOutcome::NotFound,
+                VolumeInspectProbe::Failed { reason } => probe_failed_outcome(reason),
+            }
+        }
+    }
+}
+
+fn cleanup_inspected_volume(
+    ctx: &Context,
+    runtime_cmd: &str,
+    volume: &str,
+    ncz_labeled: bool,
+    volume_policy: VolumeDeletionPolicy,
+) -> CleanupOutcome {
+    match volume_policy {
+        VolumeDeletionPolicy::MetadataOwned => {
+            cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume])
+        }
+        VolumeDeletionPolicy::RequireNczLabel {
+            destructive_recovery,
+        } => {
+            if ncz_labeled || destructive_recovery {
+                cleanup_command(ctx, runtime_cmd, &["volume", "rm", "-f", volume])
+            } else {
+                CleanupOutcome::Failed {
+                    reason: ambiguous_unlabeled_artifact_message(volume),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VolumeInspectProbe {
+    Found { ncz_labeled: bool },
+    NotFound,
+    Failed { reason: String },
+}
+
+fn inspect_volume_for_ownership(
+    ctx: &Context,
+    runtime_cmd: &str,
+    volume: &str,
+    missing_tool_behavior: MissingToolBehavior,
+) -> VolumeInspectProbe {
+    let args = ["volume", "inspect", volume];
+    match ctx.runner.run(runtime_cmd, &args) {
+        Ok(out) if out.ok() => match inspect_stdout_has_ncz_label(&out.stdout) {
+            Ok(ncz_labeled) => VolumeInspectProbe::Found { ncz_labeled },
+            Err(reason) => VolumeInspectProbe::Failed { reason },
+        },
+        Ok(out) => {
+            let missing_tool = missing_tool_behavior == MissingToolBehavior::NotFound
+                && probe_output_is_missing_tool(runtime_cmd, out.status, &out.stdout, &out.stderr);
+            let not_found =
+                probe_output_is_not_found(runtime_cmd, &args, out.status, &out.stdout, &out.stderr);
+            if missing_tool || not_found {
+                VolumeInspectProbe::NotFound
+            } else {
+                VolumeInspectProbe::Failed {
+                    reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
+                }
+            }
+        }
+        Err(err) => {
+            if missing_tool_behavior == MissingToolBehavior::NotFound
+                && command_error_is_missing_tool(&err, runtime_cmd)
+            {
+                VolumeInspectProbe::NotFound
+            } else {
+                VolumeInspectProbe::Failed {
+                    reason: err.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn inspect_stdout_has_ncz_label(stdout: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|err| {
+        format!("could not parse volume inspect labels for {NCZ_OWNERSHIP_LABEL}: {err}")
+    })?;
+    Ok(volume_inspect_value_has_ncz_label(&value))
+}
+
+fn volume_inspect_value_has_ncz_label(value: &serde_json::Value) -> bool {
+    let Some(object) = first_volume_inspect_object(value) else {
+        return false;
+    };
+    let labels = object.get("Labels").or_else(|| object.get("labels"));
+    let Some(labels) = labels.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    match labels.get(NCZ_OWNERSHIP_LABEL_KEY) {
+        Some(serde_json::Value::String(value)) => value == NCZ_OWNERSHIP_LABEL_VALUE,
+        Some(serde_json::Value::Bool(value)) => *value,
+        _ => false,
+    }
+}
+
+fn first_volume_inspect_object(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    if let Some(array) = value.as_array() {
+        return array.first().and_then(serde_json::Value::as_object);
+    }
+    value.as_object()
+}
+
+fn ambiguous_unlabeled_artifact_message(name: &str) -> String {
+    format!(
+        "ambiguous artifact {name} not labeled {NCZ_OWNERSHIP_LABEL}; not deleting. Re-run with --destructive-recovery to force delete."
+    )
 }
 
 fn probe_command(
@@ -1445,7 +1631,8 @@ fn backup_and_remove_corrupt_install_metadata(
         "metadata-force-recover: backed up corrupt agents/install-set.toml to {backup_name}"
     ));
     steps.push(
-        "metadata-remove: agents/install-set.toml deleted after corrupt metadata backup".to_string(),
+        "metadata-remove: agents/install-set.toml deleted after corrupt metadata backup"
+            .to_string(),
     );
     Ok(())
 }
@@ -1467,9 +1654,7 @@ fn corrupt_install_metadata_backup_path(
 ) -> Result<std::path::PathBuf, NczError> {
     let timestamp = OffsetDateTime::now_utc()
         .format(&Rfc3339)
-        .map_err(|err| {
-            NczError::Precondition(format!("could not format backup timestamp: {err}"))
-        })?
+        .map_err(|err| NczError::Precondition(format!("could not format backup timestamp: {err}")))?
         .replace(':', "");
     let file_name = path
         .file_name()
@@ -1776,6 +1961,62 @@ mod tests {
         );
     }
 
+    fn labeled_volume_inspect_json() -> &'static str {
+        r#"[{"Labels":{"nclawzero":"true"}}]"#
+    }
+
+    fn unlabeled_volume_inspect_json() -> &'static str {
+        r#"[{"Labels":{}}]"#
+    }
+
+    fn expect_podman_fallback_volume_cleanup(
+        runner: &FakeRunner,
+        agent: Agent,
+        inspect_stdout: &str,
+        expect_remove: bool,
+    ) {
+        let unit = service_name(agent);
+        let volume = volume_name(agent);
+        runner.expect("systemctl", &["cat", &unit], out(1, "", "not found\n"));
+        runner.expect(
+            "podman",
+            &["container", "exists", agent.slug()],
+            out(1, "", ""),
+        );
+        runner.expect("podman", &["volume", "exists", &volume], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "inspect", &volume],
+            out(0, inspect_stdout, ""),
+        );
+        if expect_remove {
+            runner.expect("podman", &["volume", "rm", "-f", &volume], out(0, "", ""));
+        }
+    }
+
+    fn expect_docker_fallback_volume_cleanup(
+        runner: &FakeRunner,
+        agent: Agent,
+        inspect_stdout: &str,
+        expect_remove: bool,
+    ) {
+        let container = docker_container_name(agent);
+        let volume = volume_name(agent);
+        runner.expect(
+            "docker",
+            &["container", "inspect", &container],
+            out(1, "", "not found\n"),
+        );
+        runner.expect(
+            "docker",
+            &["volume", "inspect", &volume],
+            out(0, inspect_stdout, ""),
+        );
+        if expect_remove {
+            runner.expect("docker", &["volume", "rm", "-f", &volume], out(0, "", ""));
+        }
+    }
+
     fn uninstall_report(report: AgentReport) -> AgentMutationReport {
         match report {
             AgentReport::Uninstall(report) => report,
@@ -1910,9 +2151,13 @@ mod tests {
             "acquire mutation lock (per F-3 + cross-cmd-mutex)"
         );
         assert!(steps.iter().any(|step| step.starts_with("podman load:")));
+        assert!(steps.iter().any(|step| {
+            step.starts_with("podman volume create") && step.contains("--label nclawzero=true")
+        }));
         assert!(steps
             .iter()
-            .any(|step| step.contains("/etc/containers/systemd/")));
+            .any(|step| step.contains("/etc/containers/systemd/")
+                && step.contains("Label=nclawzero=true")));
         assert!(steps
             .iter()
             .any(|step| step.starts_with("systemctl daemon-reload")));
@@ -1934,8 +2179,11 @@ mod tests {
         );
         assert!(steps.iter().any(|step| step.starts_with("docker load:")));
         assert!(steps.iter().any(|step| {
+            step.starts_with("docker volume create") && step.contains("--label nclawzero=true")
+        }));
+        assert!(steps.iter().any(|step| {
             step.starts_with("docker run:")
-                && step.contains("--label")
+                && step.contains("--label nclawzero=true")
                 && step.contains("--restart=unless-stopped")
                 && step.contains("no systemd")
         }));
@@ -2211,7 +2459,15 @@ mod tests {
             expect_unknown_runtime_cleanup_with_missing_podman_tools(&runner, agent);
         }
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap();
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::All,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
@@ -2238,6 +2494,119 @@ mod tests {
     }
 
     #[test]
+    fn metadata_less_uninstall_refuses_unlabeled_fallback_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        expect_podman_fallback_volume_cleanup(
+            &runner,
+            Agent::Hermes,
+            unlabeled_volume_inspect_json(),
+            false,
+        );
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("ambiguous artifact hermes-data not labeled nclawzero=true; not deleting")
+                    && message.contains("Re-run with --destructive-recovery to force delete")
+                    && message.contains("metadata preserved for retry")
+        ));
+        assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn metadata_less_uninstall_removes_labeled_fallback_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        expect_podman_fallback_volume_cleanup(
+            &runner,
+            Agent::Hermes,
+            labeled_volume_inspect_json(),
+            true,
+        );
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let report = uninstall_report(report);
+
+        assert!(report.applied);
+        assert_eq!(report.agents, vec!["hermes"]);
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman volume cleanup: hermes-data removed")));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("metadata-remove: agents/install-set.toml already absent")));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn metadata_less_destructive_recovery_removes_labeled_and_unlabeled_fallback_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        expect_podman_fallback_volume_cleanup(
+            &runner,
+            Agent::Hermes,
+            unlabeled_volume_inspect_json(),
+            true,
+        );
+        expect_docker_fallback_volume_cleanup(
+            &runner,
+            Agent::Hermes,
+            labeled_volume_inspect_json(),
+            true,
+        );
+
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let report = uninstall_report(report);
+
+        assert!(report.applied);
+        assert_eq!(report.agents, vec!["hermes"]);
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman volume cleanup: hermes-data removed")));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("docker volume cleanup: hermes-data removed")));
+        runner.assert_done();
+    }
+
+    #[test]
     fn uninstall_all_with_installed_docker_hermes_skips_uninstalled_compiled_agents() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -2248,7 +2617,15 @@ mod tests {
         let runner = FakeRunner::new();
         expect_docker_not_found_cleanup(&runner, Agent::Hermes);
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap();
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::All,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
@@ -2287,14 +2664,24 @@ mod tests {
         std::fs::write(paths.agent_install_set(), &raw).unwrap();
         let runner = FakeRunner::new();
 
-        let err =
-            uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap_err();
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::All,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
             NczError::Inconsistent(message) if message == CORRUPT_METADATA_PRESERVED_MESSAGE
         ));
-        assert_eq!(std::fs::read_to_string(paths.agent_install_set()).unwrap(), raw);
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_install_set()).unwrap(),
+            raw
+        );
         assert!(paths.lock_path.exists());
         runner.assert_done();
     }
@@ -2313,14 +2700,24 @@ mod tests {
         std::fs::write(paths.agent_install_set(), &raw).unwrap();
         let runner = FakeRunner::new();
 
-        let err =
-            uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap_err();
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::All,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
             NczError::Inconsistent(message) if message == CORRUPT_METADATA_PRESERVED_MESSAGE
         ));
-        assert_eq!(std::fs::read_to_string(paths.agent_install_set()).unwrap(), raw);
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_install_set()).unwrap(),
+            raw
+        );
         assert!(paths.lock_path.exists());
         runner.assert_done();
     }
@@ -2342,7 +2739,15 @@ mod tests {
             expect_unknown_runtime_cleanup(&runner, agent);
         }
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, true).unwrap();
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::All,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
@@ -2395,6 +2800,7 @@ mod tests {
             AgentSelector::One(Agent::Hermes),
             false,
             true,
+            false,
         )
         .unwrap_err();
 
@@ -2432,6 +2838,7 @@ mod tests {
             &ctx(&runner),
             &paths,
             AgentSelector::One(Agent::Zeroclaw),
+            false,
             false,
             false,
         )
@@ -2478,6 +2885,7 @@ mod tests {
             AgentSelector::One(Agent::Hermes),
             false,
             false,
+            false,
         )
         .unwrap();
         let report = uninstall_report(report);
@@ -2522,6 +2930,7 @@ mod tests {
             &paths,
             AgentSelector::One(Agent::Hermes),
             true,
+            false,
             false,
         )
         .unwrap_err();
@@ -2572,6 +2981,7 @@ mod tests {
             AgentSelector::One(Agent::Hermes),
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -2620,6 +3030,7 @@ mod tests {
             AgentSelector::One(Agent::Hermes),
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -2650,6 +3061,7 @@ mod tests {
             &ctx(&runner),
             &paths,
             AgentSelector::One(Agent::Hermes),
+            false,
             false,
             false,
         )
