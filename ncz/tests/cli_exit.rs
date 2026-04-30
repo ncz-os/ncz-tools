@@ -41,6 +41,11 @@ fn agent_install_rejects_relative_image_source_before_persist() {
             "naked",
             "--from",
             "fleet-cache=./relative",
+            // --dry-run guards against host-state writes if the
+            // relative-path parser ever regresses; the parse rejection
+            // happens before any persistence step, so dry-run does not
+            // mask the assertion under test.
+            "--dry-run",
         ])
         .output()
         .unwrap();
