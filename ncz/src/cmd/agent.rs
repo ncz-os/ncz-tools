@@ -374,11 +374,17 @@ pub fn run_with_paths(ctx: &Context, paths: &Paths, action: AgentAction) -> Resu
         }
         AgentAction::Status => status(ctx, paths)?,
         AgentAction::Lint { bundle } => lint(ctx, paths, bundle.as_deref())?,
-        AgentAction::Uninstall { all, agent, full } => uninstall(
+        AgentAction::Uninstall {
+            all,
+            agent,
+            full,
+            force_recover_from_corrupt,
+        } => uninstall(
             ctx,
             paths,
             AgentSelector::from_uninstall_args(all, agent),
             full,
+            force_recover_from_corrupt,
         )?,
     };
     let code = match &report {
@@ -452,6 +458,12 @@ const INSTALL_NON_DRY_RUN_PRECONDITION: &str = concat!(
     "bodies land in the next slice."
 );
 
+const CORRUPT_METADATA_PRESERVED_MESSAGE: &str = concat!(
+    "metadata could not be parsed (possibly newer schema); ",
+    "corrupt metadata preserved for retry. ",
+    "To force-recover, run ncz agent uninstall --force-recover-from-corrupt."
+);
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn apply_install(paths: &Paths, spec: AgentSpec) -> Result<AgentInstallReport, NczError> {
     let planned_steps = planned_steps_for(&spec);
@@ -511,13 +523,20 @@ fn uninstall(
     paths: &Paths,
     selector: AgentSelector,
     full: bool,
+    force_recover_from_corrupt: bool,
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
-    let plan = uninstall_plan(paths, selector);
+    let plan = uninstall_plan(paths, selector, force_recover_from_corrupt)?;
     reject_unsafe_full_uninstall(full, selector, &plan.metadata)?;
     let mut planned_steps = uninstall_metadata_steps(&plan.metadata);
     cleanup_uninstall_artifacts(ctx, paths, &plan.targets, full, &mut planned_steps)?;
-    remove_uninstall_metadata(paths, selector, &plan.metadata, &mut planned_steps)?;
+    remove_uninstall_metadata(
+        paths,
+        selector,
+        &plan.metadata,
+        force_recover_from_corrupt,
+        &mut planned_steps,
+    )?;
     Ok(AgentReport::Uninstall(AgentMutationReport {
         schema_version: common::SCHEMA_VERSION,
         action: "uninstall".to_string(),
@@ -602,10 +621,21 @@ enum OptionalInstallMetadata {
     Corrupt(String),
 }
 
-fn uninstall_plan(paths: &Paths, selector: AgentSelector) -> UninstallPlan {
+fn uninstall_plan(
+    paths: &Paths,
+    selector: AgentSelector,
+    force_recover_from_corrupt: bool,
+) -> Result<UninstallPlan, NczError> {
     let metadata = load_optional_install_metadata(paths);
+    if matches!(metadata, OptionalInstallMetadata::Corrupt(_)) && !force_recover_from_corrupt {
+        return Err(corrupt_metadata_preserved_error());
+    }
     let targets = uninstall_targets(selector, &metadata);
-    UninstallPlan { metadata, targets }
+    Ok(UninstallPlan { metadata, targets })
+}
+
+fn corrupt_metadata_preserved_error() -> NczError {
+    NczError::Inconsistent(CORRUPT_METADATA_PRESERVED_MESSAGE.to_string())
 }
 
 fn uninstall_targets(
@@ -1299,6 +1329,7 @@ fn remove_uninstall_metadata(
     paths: &Paths,
     selector: AgentSelector,
     metadata: &OptionalInstallMetadata,
+    force_recover_from_corrupt: bool,
     steps: &mut Vec<String>,
 ) -> Result<(), NczError> {
     let selected = selected_uninstall_agents(selector);
@@ -1336,16 +1367,108 @@ fn remove_uninstall_metadata(
         OptionalInstallMetadata::Missing(_) => {
             steps.push("metadata-remove: agents/install-set.toml already absent".to_string());
         }
+        OptionalInstallMetadata::Corrupt(_) if force_recover_from_corrupt => {
+            backup_and_remove_corrupt_install_metadata(paths, steps)?;
+        }
         OptionalInstallMetadata::Corrupt(_) => {
-            let removed = remove_install_set_path(paths)?;
-            steps.push(if removed {
-                "metadata-remove: agents/install-set.toml deleted corrupt metadata".to_string()
-            } else {
-                "metadata-remove: agents/install-set.toml already absent".to_string()
-            });
+            return Err(corrupt_metadata_preserved_error());
         }
     }
     Ok(())
+}
+
+fn backup_and_remove_corrupt_install_metadata(
+    paths: &Paths,
+    steps: &mut Vec<String>,
+) -> Result<(), NczError> {
+    let path = paths.agent_install_set();
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(NczError::Inconsistent(format!(
+                "cannot force-recover corrupt install metadata at {}: path is a directory; corrupt metadata preserved for retry",
+                path.display()
+            )));
+        }
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            steps.push("metadata-remove: agents/install-set.toml already absent".to_string());
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(NczError::Inconsistent(format!(
+                "cannot inspect corrupt install metadata at {}: {err}; corrupt metadata preserved for retry",
+                path.display()
+            )));
+        }
+    };
+
+    let body = fs::read(&path).map_err(|err| {
+        NczError::Inconsistent(format!(
+            "cannot read corrupt install metadata at {}: {err}; corrupt metadata preserved for retry",
+            path.display()
+        ))
+    })?;
+    let backup_path = corrupt_install_metadata_backup_path(&path)?;
+    state::atomic_write(&backup_path, &body, metadata_permissions(&metadata)).map_err(
+        |err| {
+            NczError::Inconsistent(format!(
+                "cannot back up corrupt install metadata from {} to {}: {err}; corrupt metadata preserved for retry",
+                path.display(),
+                backup_path.display()
+            ))
+        },
+    )?;
+    state::remove_file_durable(&path).map_err(|err| {
+        NczError::Inconsistent(format!(
+            "cannot remove corrupt install metadata at {} after backup to {}: {err}; backup preserved for retry",
+            path.display(),
+            backup_path.display()
+        ))
+    })?;
+    let backup_name = backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("install-set.toml.corrupt-backup");
+    steps.push(format!(
+        "metadata-force-recover: backed up corrupt agents/install-set.toml to {backup_name}"
+    ));
+    steps.push(
+        "metadata-remove: agents/install-set.toml deleted after corrupt metadata backup".to_string(),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_permissions(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn metadata_permissions(_metadata: &fs::Metadata) -> u32 {
+    0o644
+}
+
+fn corrupt_install_metadata_backup_path(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, NczError> {
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|err| {
+            NczError::Precondition(format!("could not format backup timestamp: {err}"))
+        })?
+        .replace(':', "");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            NczError::Precondition(format!(
+                "install metadata path has no filename: {}",
+                path.display()
+            ))
+        })?;
+    Ok(path.with_file_name(format!("{file_name}.corrupt-backup-{timestamp}")))
 }
 
 fn remove_install_set_path(paths: &Paths) -> Result<bool, NczError> {
@@ -2076,7 +2199,7 @@ mod tests {
             expect_unknown_runtime_cleanup_with_missing_podman_tools(&runner, agent);
         }
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false).unwrap();
+        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
@@ -2113,7 +2236,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_docker_not_found_cleanup(&runner, Agent::Hermes);
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false).unwrap();
+        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
@@ -2139,37 +2262,105 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_all_with_corrupted_install_set_succeeds_with_compiled_agent_fallback() {
+    fn uninstall_with_unsupported_install_set_schema_preserves_metadata_and_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        std::fs::create_dir_all(paths.agent_config_dir()).unwrap();
-        std::fs::write(paths.agent_install_set(), "").unwrap();
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let raw = std::fs::read_to_string(paths.agent_install_set())
+            .unwrap()
+            .replacen("schema_version = 1", "schema_version = 999", 1);
+        std::fs::write(paths.agent_install_set(), &raw).unwrap();
         let runner = FakeRunner::new();
-        for agent in Agent::ALL {
-            expect_unknown_runtime_cleanup(&runner, agent);
-        }
 
-        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false).unwrap();
+        let err =
+            uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message) if message == CORRUPT_METADATA_PRESERVED_MESSAGE
+        ));
+        assert_eq!(std::fs::read_to_string(paths.agent_install_set()).unwrap(), raw);
+        assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_with_unknown_install_set_agent_preserves_metadata_and_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let raw = std::fs::read_to_string(paths.agent_install_set())
+            .unwrap()
+            .replace("agent = \"hermes\"", "agent = \"newclaw\"");
+        std::fs::write(paths.agent_install_set(), &raw).unwrap();
+        let runner = FakeRunner::new();
+
+        let err =
+            uninstall(&ctx(&runner), &paths, AgentSelector::All, false, false).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message) if message == CORRUPT_METADATA_PRESERVED_MESSAGE
+        ));
+        assert_eq!(std::fs::read_to_string(paths.agent_install_set()).unwrap(), raw);
+        assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_force_recover_from_corrupt_backs_up_and_removes_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let raw = std::fs::read_to_string(paths.agent_install_set())
+            .unwrap()
+            .replacen("schema_version = 1", "schema_version = 999", 1);
+        std::fs::write(paths.agent_install_set(), &raw).unwrap();
+        let runner = FakeRunner::new();
+        expect_unknown_runtime_cleanup(&runner, Agent::Hermes);
+
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            true,
+        )
+        .unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
-        assert_eq!(report.agents, vec!["zeroclaw", "openclaw", "hermes"]);
-        assert!(report
-            .planned_steps
-            .iter()
-            .any(|step| step.contains("metadata-load: agents/install-set.toml corrupt")));
-        assert!(report
-            .planned_steps
-            .iter()
-            .any(|step| step.contains("podman volume cleanup: hermes-data not found")));
-        assert!(report
-            .planned_steps
-            .iter()
-            .any(|step| step.contains("docker volume cleanup: hermes-data not found")));
+        assert_eq!(report.agents, vec!["hermes"]);
         assert!(report.planned_steps.iter().any(|step| {
-            step.contains("metadata-remove: agents/install-set.toml deleted corrupt metadata")
+            step.contains("metadata-force-recover: backed up corrupt agents/install-set.toml")
+        }));
+        assert!(report.planned_steps.iter().any(|step| {
+            step.contains(
+                "metadata-remove: agents/install-set.toml deleted after corrupt metadata backup",
+            )
         }));
         assert!(!paths.agent_install_set().exists());
+        let backups = std::fs::read_dir(paths.agent_config_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(name) if name.starts_with("install-set.toml.corrupt-backup-")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), raw);
         assert!(paths.lock_path.exists());
         runner.assert_done();
     }
@@ -2188,6 +2379,7 @@ mod tests {
             &ctx(&runner),
             &paths,
             AgentSelector::One(Agent::Zeroclaw),
+            false,
             false,
         )
         .unwrap();
@@ -2231,6 +2423,7 @@ mod tests {
             &ctx(&runner),
             &paths,
             AgentSelector::One(Agent::Hermes),
+            false,
             false,
         )
         .unwrap();
@@ -2276,6 +2469,7 @@ mod tests {
             &paths,
             AgentSelector::One(Agent::Hermes),
             true,
+            false,
         )
         .unwrap_err();
 
@@ -2324,6 +2518,7 @@ mod tests {
             &paths,
             AgentSelector::One(Agent::Hermes),
             false,
+            false,
         )
         .unwrap_err();
 
@@ -2371,6 +2566,7 @@ mod tests {
             &paths,
             AgentSelector::One(Agent::Hermes),
             false,
+            false,
         )
         .unwrap_err();
 
@@ -2401,6 +2597,7 @@ mod tests {
             &ctx(&runner),
             &paths,
             AgentSelector::One(Agent::Hermes),
+            false,
             false,
         )
         .unwrap();
