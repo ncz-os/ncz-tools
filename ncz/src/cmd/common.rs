@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::agent_spec::Agent;
 use crate::error::NczError;
 use crate::state::{self, agent, Paths};
 use crate::sys::{systemd, CommandRunner, ProcessOutput};
@@ -11,7 +12,7 @@ use crate::sys::{systemd, CommandRunner, ProcessOutput};
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub fn validate_agent(name: &str) -> Result<(), NczError> {
-    if agent::AGENTS.contains(&name) {
+    if Agent::from_slug(name).is_some() {
         Ok(())
     } else {
         Err(NczError::Usage(format!("unknown agent: {name}")))

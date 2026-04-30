@@ -2,7 +2,33 @@
 
 use clap::{Parser, Subcommand};
 
+use crate::agent_spec::Agent;
 use crate::sys::CommandRunner;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentName(Agent);
+
+impl AgentName {
+    pub fn into_agent(self) -> Agent {
+        self.0
+    }
+}
+
+impl From<Agent> for AgentName {
+    fn from(agent: Agent) -> Self {
+        Self(agent)
+    }
+}
+
+impl std::str::FromStr for AgentName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Agent::from_slug(value).map(Self).ok_or_else(|| {
+            format!("unknown agent '{value}'; expected one of: zeroclaw, openclaw, hermes")
+        })
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -341,21 +367,21 @@ pub enum AgentAction {
     #[non_exhaustive]
     Enable {
         /// Agent name (zeroclaw|openclaw|hermes).
-        agent: String,
+        agent: AgentName,
     },
     /// Disable an installed agent (stop and mask its systemd unit; keeps
     /// the OCI image and quadlet files in place for re-enable).
     #[non_exhaustive]
     Disable {
         /// Agent name.
-        agent: String,
+        agent: AgentName,
     },
     /// Reload an agent (re-pull image, restart unit). Used after an OCI
     /// image bump in the catalog.
     #[non_exhaustive]
     Reload {
         /// Agent name; omit to reload all installed agents.
-        agent: Option<String>,
+        agent: Option<AgentName>,
     },
     /// Show installed agents + their state (running, stopped, failed).
     Status,
@@ -373,12 +399,72 @@ pub enum AgentAction {
     #[non_exhaustive]
     Uninstall {
         /// Agent name; omit to uninstall all.
-        agent: Option<String>,
+        agent: Option<AgentName>,
         /// Also remove `/etc/nclawzero/agent-env` and provider data dirs.
         /// Default leaves them for re-install.
         #[arg(long)]
         full: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::error::ErrorKind;
+    use clap::Parser;
+
+    use crate::agent_spec::Agent;
+
+    use super::*;
+
+    #[test]
+    fn agent_enable_parses_agent_name_to_typed_value() {
+        let cli = Cli::try_parse_from(["ncz", "agent", "enable", "zeroclaw"]).unwrap();
+
+        let Command::Agent {
+            action: AgentAction::Enable { agent },
+        } = cli.command
+        else {
+            panic!("expected agent enable command");
+        };
+        assert_eq!(agent.into_agent(), Agent::Zeroclaw);
+    }
+
+    #[test]
+    fn agent_lifecycle_rejects_unknown_or_path_like_agents() {
+        for value in ["zeroclaw2", "../../../etc"] {
+            let err = Cli::try_parse_from(["ncz", "agent", "enable", value]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn reload_and_uninstall_use_none_as_all_selector() {
+        let reload = Cli::try_parse_from(["ncz", "agent", "reload"]).unwrap();
+        let Command::Agent {
+            action: AgentAction::Reload { agent: None },
+        } = reload.command
+        else {
+            panic!("expected agent reload all");
+        };
+
+        let uninstall = Cli::try_parse_from(["ncz", "agent", "uninstall"]).unwrap();
+        let Command::Agent {
+            action:
+                AgentAction::Uninstall {
+                    agent: None,
+                    full: false,
+                },
+        } = uninstall.command
+        else {
+            panic!("expected agent uninstall all");
+        };
+    }
+
+    #[test]
+    fn status_does_not_accept_agent_argument() {
+        let err = Cli::try_parse_from(["ncz", "agent", "status", "zeroclaw"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
 }
 
 #[derive(Subcommand, Debug)]

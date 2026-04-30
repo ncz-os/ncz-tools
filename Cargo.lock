@@ -1632,13 +1632,16 @@ name = "ncz"
 version = "0.4.0"
 dependencies = [
  "clap",
+ "flate2",
  "rustix 0.38.44",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "time",
+ "toml",
  "ureq",
 ]
 
