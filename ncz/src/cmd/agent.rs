@@ -383,7 +383,7 @@ pub fn run_with_paths(ctx: &Context, paths: &Paths, action: AgentAction) -> Resu
 /// Docker restart policy / labels without systemd.
 fn install(
     _ctx: &Context,
-    paths: &Paths,
+    _paths: &Paths,
     profile: Option<&str>,
     variant: &str,
     sandbox: &str,
@@ -396,31 +396,62 @@ fn install(
     let image_source = parse_image_source(from)?;
     let spec = AgentSpec {
         profile,
-        variant: variant.clone(),
+        variant,
         sandbox,
         image_source,
     };
     spec.validate()
         .map_err(|e: SpecError| NczError::Precondition(e.to_string()))?;
 
-    // V1.0 scaffold: planned-steps emission + dry-run support; the actual
-    // OCI-pull / runtime-specific laydown / enable cycle is the next
-    // implementation slice. Install metadata is still persisted so later
-    // lifecycle operations keep the same Podman-vs-Docker split selected at
-    // install time.
-    let planned_steps = planned_steps_for(&spec);
+    // V1.0 scaffold: planned-steps emission + dry-run support. Bodies
+    // (OCI pull, runtime-specific laydown, enable cycle, invariant
+    // validation) are not yet implemented — they land in the next slice.
+    //
+    // Until those bodies exist, non-dry-run install MUST refuse rather
+    // than persist install-set.toml metadata. Persisting metadata for an
+    // install that never deployed any images would mislead later
+    // lifecycle/status ops into treating the host as installed when only
+    // the metadata is present — making recovery and rollback harder.
+    //
+    // Per-finding round-6 (review-mol2a73y-4z6qhl): metadata persistence
+    // moves to AFTER image load + laydown + enable + invariant validation
+    // succeed, which is the next implementation slice. Until then,
+    // non-dry-run is gated behind Precondition just like enable/disable/
+    // reload/uninstall bodies.
     if !dry_run {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
-        persist_install_metadata(paths, &spec)?;
+        return Err(NczError::Precondition(
+            INSTALL_NON_DRY_RUN_PRECONDITION.to_string(),
+        ));
     }
 
     Ok(AgentReport::Install(AgentInstallReport {
         schema_version: common::SCHEMA_VERSION,
+        planned_steps: planned_steps_for(&spec),
+        spec,
+        applied: false,
+        dry_run: true,
+    }))
+}
+
+const INSTALL_NON_DRY_RUN_PRECONDITION: &str = concat!(
+    "agent install bodies pending — only --dry-run is supported in V1.0 scaffold. ",
+    "The install machinery (apply_install, persist_install_metadata) is tested separately; ",
+    "the public install() will gain non-dry-run support when OCI pull / laydown / enable ",
+    "bodies land in the next slice."
+);
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn apply_install(paths: &Paths, spec: AgentSpec) -> Result<AgentInstallReport, NczError> {
+    let planned_steps = planned_steps_for(&spec);
+    let _lock = state::acquire_lock(&paths.lock_path)?;
+    persist_install_metadata(paths, &spec)?;
+    Ok(AgentInstallReport {
+        schema_version: common::SCHEMA_VERSION,
         spec,
         planned_steps,
-        applied: !dry_run,
-        dry_run,
-    }))
+        applied: true,
+        dry_run: false,
+    })
 }
 
 fn mutate(
@@ -1061,29 +1092,57 @@ mod tests {
     }
 
     #[test]
-    fn install_persists_metadata_after_planning_when_not_dry_run() {
+    fn install_returns_precondition_when_not_dry_run() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
 
-        let report = install(
+        let err = install(
             &ctx(&runner),
             &paths,
-            Some("macos-arm64-docker"),
-            "single=hermes",
-            "naked",
+            Some("rpi5-16gb"),
+            "triple",
+            "openshell",
             "registry",
             false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message == INSTALL_NON_DRY_RUN_PRECONDITION
+        ));
+        assert!(!paths.lock_path.exists());
+        assert!(!paths.lock_path.parent().unwrap().exists());
+        assert!(!paths.agent_install_set().exists());
+    }
+
+    #[test]
+    fn install_persists_metadata_after_planning_when_not_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+
+        let report = apply_install(
+            &paths,
+            AgentSpec {
+                profile: ProfileTarget::MacosArm64Docker,
+                variant: Variant::Single {
+                    agent: Agent::Hermes,
+                },
+                sandbox: SandboxKind::Naked,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap();
 
         assert!(matches!(
             report,
-            AgentReport::Install(AgentInstallReport {
+            AgentInstallReport {
                 applied: true,
                 dry_run: false,
                 ..
-            })
+            }
         ));
         assert!(paths.lock_path.exists());
         assert!(paths.agent_install_set().exists());
@@ -1109,16 +1168,15 @@ mod tests {
     fn reinstall_replaces_authoritative_install_set() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        let runner = FakeRunner::new();
 
-        install(
-            &ctx(&runner),
+        apply_install(
             &paths,
-            Some("macos-arm64-docker"),
-            "triple",
-            "naked",
-            "registry",
-            false,
+            AgentSpec {
+                profile: ProfileTarget::MacosArm64Docker,
+                variant: Variant::Triple,
+                sandbox: SandboxKind::Naked,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1126,14 +1184,16 @@ mod tests {
             vec!["zeroclaw", "openclaw", "hermes"]
         );
 
-        install(
-            &ctx(&runner),
+        apply_install(
             &paths,
-            Some("macos-arm64-docker"),
-            "single=hermes",
-            "naked",
-            "registry",
-            false,
+            AgentSpec {
+                profile: ProfileTarget::MacosArm64Docker,
+                variant: Variant::Single {
+                    agent: Agent::Hermes,
+                },
+                sandbox: SandboxKind::Naked,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap();
 
@@ -1150,17 +1210,18 @@ mod tests {
     fn install_recovers_empty_directory_at_install_set_path() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        let runner = FakeRunner::new();
         std::fs::create_dir_all(paths.agent_install_set()).unwrap();
 
-        install(
-            &ctx(&runner),
+        apply_install(
             &paths,
-            Some("macos-arm64-docker"),
-            "single=hermes",
-            "naked",
-            "registry",
-            false,
+            AgentSpec {
+                profile: ProfileTarget::MacosArm64Docker,
+                variant: Variant::Single {
+                    agent: Agent::Hermes,
+                },
+                sandbox: SandboxKind::Naked,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap();
 
@@ -1173,18 +1234,19 @@ mod tests {
     fn install_rejects_non_empty_directory_at_install_set_path() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        let runner = FakeRunner::new();
         std::fs::create_dir_all(paths.agent_install_set()).unwrap();
         std::fs::write(paths.agent_install_set().join("leftover"), "stale").unwrap();
 
-        let err = install(
-            &ctx(&runner),
+        let err = apply_install(
             &paths,
-            Some("macos-arm64-docker"),
-            "single=hermes",
-            "naked",
-            "registry",
-            false,
+            AgentSpec {
+                profile: ProfileTarget::MacosArm64Docker,
+                variant: Variant::Single {
+                    agent: Agent::Hermes,
+                },
+                sandbox: SandboxKind::Naked,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap_err();
 
@@ -1233,26 +1295,25 @@ mod tests {
     fn install_non_dry_run_acquires_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        let runner = FakeRunner::new();
 
-        let report = install(
-            &ctx(&runner),
+        let report = apply_install(
             &paths,
-            Some("rpi5-16gb"),
-            "triple",
-            "openshell",
-            "registry",
-            false,
+            AgentSpec {
+                profile: ProfileTarget::Rpi5_16gb,
+                variant: Variant::Triple,
+                sandbox: SandboxKind::OpenShell,
+                image_source: ImageSource::Registry,
+            },
         )
         .unwrap();
 
         assert!(matches!(
             report,
-            AgentReport::Install(AgentInstallReport {
+            AgentInstallReport {
                 applied: true,
                 dry_run: false,
                 ..
-            })
+            }
         ));
         assert!(paths.lock_path.exists());
     }
@@ -1472,16 +1533,17 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let paths = test_paths(tmp.path());
-            let runner = FakeRunner::new();
 
-            install(
-                &ctx(&runner),
+            apply_install(
                 &paths,
-                Some("macos-arm64-docker"),
-                "single=hermes",
-                "naked",
-                from,
-                false,
+                AgentSpec {
+                    profile: ProfileTarget::MacosArm64Docker,
+                    variant: Variant::Single {
+                        agent: Agent::Hermes,
+                    },
+                    sandbox: SandboxKind::Naked,
+                    image_source: parse_image_source(from).unwrap(),
+                },
             )
             .unwrap();
 
