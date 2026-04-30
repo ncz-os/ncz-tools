@@ -26,3 +26,27 @@ fn backup_create_exclude_volumes_conflicts_with_unsafe_live_volumes() {
 
     assert_eq!(status.code(), Some(1));
 }
+
+#[test]
+fn agent_install_rejects_relative_image_source_before_persist() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ncz"))
+        .args([
+            "agent",
+            "install",
+            "--profile",
+            "macos-arm64-docker",
+            "--variant",
+            "single=hermes",
+            "--sandbox",
+            "naked",
+            "--from",
+            "fleet-cache=./relative",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("usage: image source path must be absolute"));
+    assert!(stderr.contains("fleet-cache=/absolute/path"));
+}

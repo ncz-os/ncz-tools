@@ -12,6 +12,8 @@
 //! arbitrary user-provided profiles for a fleet of <10 known device types.
 
 use std::fmt;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -191,9 +193,76 @@ pub enum ImageSource {
     Registry,
     /// Pull from a known fleet-cache directory (e.g., NFS mount of
     /// /mnt/argonas/agent-images/). Faster on LAN, requires a refresh step.
-    FleetCache { path: std::path::PathBuf },
+    FleetCache { path: AbsoluteImagePath },
     /// Single tarball file on disk — for air-gap commissioning via USB key.
-    Tarball { path: std::path::PathBuf },
+    Tarball { path: AbsoluteImagePath },
+}
+
+impl ImageSource {
+    pub fn fleet_cache(path: impl Into<PathBuf>) -> Result<Self, SpecError> {
+        Ok(Self::FleetCache {
+            path: AbsoluteImagePath::new(path)?,
+        })
+    }
+
+    pub fn tarball(path: impl Into<PathBuf>) -> Result<Self, SpecError> {
+        Ok(Self::Tarball {
+            path: AbsoluteImagePath::new(path)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AbsoluteImagePath(PathBuf);
+
+impl AbsoluteImagePath {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, SpecError> {
+        let path = path.into();
+        if path.is_absolute() {
+            Ok(Self(path))
+        } else {
+            Err(SpecError::ImageSourcePathNotAbsolute { path })
+        }
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AbsoluteImagePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let path = PathBuf::deserialize(deserializer)?;
+        Self::new(path).map_err(serde::de::Error::custom)
+    }
+}
+
+impl AsRef<Path> for AbsoluteImagePath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl Deref for AbsoluteImagePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+impl fmt::Display for AbsoluteImagePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
 }
 
 /// Full deployment specification — what ncz agent install consumes.
@@ -238,6 +307,8 @@ pub enum SpecError {
         profile: ProfileTarget,
         variant: Variant,
     },
+    #[error("image source path must be absolute: {}", path.display())]
+    ImageSourcePathNotAbsolute { path: PathBuf },
 }
 
 #[cfg(test)]
@@ -328,5 +399,33 @@ mod tests {
     fn image_source_defaults_to_registry() {
         let src: ImageSource = serde_json::from_str("null").unwrap_or_default();
         assert!(matches!(src, ImageSource::Registry));
+    }
+
+    #[test]
+    fn image_source_constructors_reject_relative_paths() {
+        let err = ImageSource::fleet_cache("relative/cache").unwrap_err();
+        assert!(matches!(
+            err,
+            SpecError::ImageSourcePathNotAbsolute { path }
+                if path.as_path() == Path::new("relative/cache")
+        ));
+
+        let err = ImageSource::tarball("./agent.tar").unwrap_err();
+        assert!(matches!(
+            err,
+            SpecError::ImageSourcePathNotAbsolute { path }
+                if path.as_path() == Path::new("./agent.tar")
+        ));
+    }
+
+    #[test]
+    fn image_source_deserialize_rejects_relative_paths() {
+        let err =
+            serde_json::from_str::<ImageSource>(r#"{"fleet-cache":{"path":"relative/cache"}}"#)
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("image source path must be absolute"));
     }
 }

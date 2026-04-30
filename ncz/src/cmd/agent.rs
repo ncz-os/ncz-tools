@@ -9,7 +9,6 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 use serde::{ser::SerializeStruct, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -738,17 +737,15 @@ fn parse_image_source(s: &str) -> Result<ImageSource, NczError> {
                 if path.is_empty() {
                     Err(invalid_image_source(s))
                 } else {
-                    Ok(ImageSource::FleetCache {
-                        path: PathBuf::from(path),
-                    })
+                    ImageSource::fleet_cache(path)
+                        .map_err(|err| invalid_image_source_path("fleet-cache", err))
                 }
             } else if let Some(path) = s.strip_prefix("tarball=") {
                 if path.is_empty() {
                     Err(invalid_image_source(s))
                 } else {
-                    Ok(ImageSource::Tarball {
-                        path: PathBuf::from(path),
-                    })
+                    ImageSource::tarball(path)
+                        .map_err(|err| invalid_image_source_path("tarball", err))
                 }
             } else {
                 Err(invalid_image_source(s))
@@ -761,6 +758,10 @@ fn invalid_image_source(s: &str) -> NczError {
     NczError::Usage(format!(
         "unknown image source '{s}'; expected 'registry', 'fleet-cache=<path>', or 'tarball=<path>'"
     ))
+}
+
+fn invalid_image_source_path(kind: &str, err: SpecError) -> NczError {
+    NczError::Usage(format!("{err}; use '{kind}=/absolute/path'"))
 }
 
 fn parse_sandbox(s: &str) -> Result<SandboxKind, NczError> {
@@ -890,22 +891,29 @@ mod tests {
         );
         assert_eq!(
             parse_image_source("fleet-cache=/mnt/argonas/agent-images").unwrap(),
-            ImageSource::FleetCache {
-                path: PathBuf::from("/mnt/argonas/agent-images"),
-            }
-        );
-        assert_eq!(
-            parse_image_source("fleet-cache=relative/cache").unwrap(),
-            ImageSource::FleetCache {
-                path: PathBuf::from("relative/cache"),
-            }
+            ImageSource::fleet_cache("/mnt/argonas/agent-images").unwrap()
         );
         assert_eq!(
             parse_image_source("tarball=/tmp/agent.tar").unwrap(),
-            ImageSource::Tarball {
-                path: PathBuf::from("/tmp/agent.tar"),
-            }
+            ImageSource::tarball("/tmp/agent.tar").unwrap()
         );
+    }
+
+    #[test]
+    fn rejects_relative_image_source_paths() {
+        for (source, expected_hint) in [
+            ("fleet-cache=./relative", "fleet-cache=/absolute/path"),
+            ("tarball=./rel.tar", "tarball=/absolute/path"),
+        ] {
+            let err = parse_image_source(source).unwrap_err();
+            assert!(matches!(
+                err,
+                NczError::Usage(message)
+                    if message.contains("image source path must be absolute")
+                        && message.contains(source.split_once('=').unwrap().1)
+                        && message.contains(expected_hint)
+            ));
+        }
     }
 
     #[test]
@@ -937,9 +945,7 @@ mod tests {
             AgentReport::Install(report) => {
                 assert_eq!(
                     report.spec.image_source,
-                    ImageSource::Tarball {
-                        path: PathBuf::from("/tmp/hermes.tar")
-                    }
+                    ImageSource::tarball("/tmp/hermes.tar").unwrap()
                 );
                 assert!(!report.applied);
                 assert!(report.dry_run);
@@ -1141,6 +1147,60 @@ mod tests {
     }
 
     #[test]
+    fn install_recovers_empty_directory_at_install_set_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        std::fs::create_dir_all(paths.agent_install_set()).unwrap();
+
+        install(
+            &ctx(&runner),
+            &paths,
+            Some("macos-arm64-docker"),
+            "single=hermes",
+            "naked",
+            "registry",
+            false,
+        )
+        .unwrap();
+
+        assert!(paths.agent_install_set().is_file());
+        let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
+        assert_eq!(metadata_agents(&installed), vec!["hermes"]);
+    }
+
+    #[test]
+    fn install_rejects_non_empty_directory_at_install_set_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        std::fs::create_dir_all(paths.agent_install_set()).unwrap();
+        std::fs::write(paths.agent_install_set().join("leftover"), "stale").unwrap();
+
+        let err = install(
+            &ctx(&runner),
+            &paths,
+            Some("macos-arm64-docker"),
+            "single=hermes",
+            "naked",
+            "registry",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("cannot replace non-empty install metadata directory")
+                    && message.contains("install-set.toml")
+                    && message.contains("remove the directory at")
+                    && message.contains("manually then re-run install")
+        ));
+        assert!(paths.agent_install_set().is_dir());
+        assert!(paths.agent_install_set().join("leftover").exists());
+    }
+
+    #[test]
     fn mutating_agent_actions_acquire_lock() {
         for action in [
             AgentAction::Enable {
@@ -1332,9 +1392,7 @@ mod tests {
                 "podman registry image refresh + systemctl restart hermes.service",
             ),
             (
-                ImageSource::FleetCache {
-                    path: PathBuf::from("/mnt/argonas/agent-images"),
-                },
+                ImageSource::fleet_cache("/mnt/argonas/agent-images").unwrap(),
                 "podman fleet-cache image refresh from /mnt/argonas/agent-images + systemctl restart hermes.service",
             ),
         ] {
@@ -1378,9 +1436,7 @@ mod tests {
             vec![test_metadata_with_source(
                 Agent::Hermes,
                 ContainerRuntime::Docker,
-                ImageSource::Tarball {
-                    path: PathBuf::from("/tmp/hermes.tar"),
-                },
+                ImageSource::tarball("/tmp/hermes.tar").unwrap(),
             )],
         );
 
@@ -1407,15 +1463,11 @@ mod tests {
             ("registry", ImageSource::Registry),
             (
                 "fleet-cache=/mnt/argonas/agent-images",
-                ImageSource::FleetCache {
-                    path: PathBuf::from("/mnt/argonas/agent-images"),
-                },
+                ImageSource::fleet_cache("/mnt/argonas/agent-images").unwrap(),
             ),
             (
                 "tarball=/tmp/hermes.tar",
-                ImageSource::Tarball {
-                    path: PathBuf::from("/tmp/hermes.tar"),
-                },
+                ImageSource::tarball("/tmp/hermes.tar").unwrap(),
             ),
         ] {
             let tmp = tempfile::tempdir().unwrap();

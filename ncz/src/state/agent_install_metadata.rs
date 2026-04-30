@@ -45,7 +45,62 @@ pub fn write_install_set(
     let body = toml::to_string_pretty(&install_set).map_err(|err| {
         NczError::Precondition(format!("could not serialize install set metadata: {err}"))
     })?;
+    recover_install_set_directory(&path)?;
     state::atomic_write(&path, body.as_bytes(), 0o644)
+}
+
+fn recover_install_set_directory(path: &Path) -> Result<(), NczError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(corrupt_install_set_error(
+                path,
+                format!("could not inspect file: {err}"),
+            ));
+        }
+    }
+
+    let mut entries = fs::read_dir(path).map_err(|err| {
+        NczError::Inconsistent(format!(
+            "cannot inspect install metadata directory at {}: {err}; remove the directory at {} manually then re-run install",
+            path.display(),
+            path.display()
+        ))
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|err| {
+            NczError::Inconsistent(format!(
+                "cannot inspect install metadata directory at {}: {err}; remove the directory at {} manually then re-run install",
+                path.display(),
+                path.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(NczError::Inconsistent(format!(
+            "cannot replace non-empty install metadata directory at {}; remove the directory at {} manually then re-run install",
+            path.display(),
+            path.display()
+        )));
+    }
+    drop(entries);
+
+    fs::remove_dir(path).map_err(|err| {
+        NczError::Inconsistent(format!(
+            "cannot remove empty install metadata directory at {}: {err}; remove the directory at {} manually then re-run install",
+            path.display(),
+            path.display()
+        ))
+    })?;
+
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub fn read(paths: &Paths, agent: Agent) -> Result<AgentInstallMetadata, NczError> {
