@@ -586,7 +586,13 @@ struct UninstallPlan {
 #[derive(Debug, Clone)]
 struct UninstallTarget {
     agent: Agent,
-    runtime: Option<ContainerRuntime>,
+    runtime_strategy: RuntimeCleanupStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCleanupStrategy {
+    Declared(ContainerRuntime),
+    FallbackBothRuntimes,
 }
 
 #[derive(Debug, Clone)]
@@ -598,14 +604,48 @@ enum OptionalInstallMetadata {
 
 fn uninstall_plan(paths: &Paths, selector: AgentSelector) -> UninstallPlan {
     let metadata = load_optional_install_metadata(paths);
-    let targets = selected_uninstall_agents(selector)
-        .into_iter()
-        .map(|agent| UninstallTarget {
-            agent,
-            runtime: metadata.runtime_for(agent),
-        })
-        .collect();
+    let targets = uninstall_targets(selector, &metadata);
     UninstallPlan { metadata, targets }
+}
+
+fn uninstall_targets(
+    selector: AgentSelector,
+    metadata: &OptionalInstallMetadata,
+) -> Vec<UninstallTarget> {
+    match metadata {
+        OptionalInstallMetadata::Loaded(installed) => {
+            selected_installed_metadata(selector, installed)
+                .into_iter()
+                .map(|entry| UninstallTarget {
+                    agent: entry.agent,
+                    runtime_strategy: RuntimeCleanupStrategy::Declared(entry.runtime),
+                })
+                .collect()
+        }
+        OptionalInstallMetadata::Missing(_) | OptionalInstallMetadata::Corrupt(_) => {
+            selected_uninstall_agents(selector)
+                .into_iter()
+                .map(|agent| UninstallTarget {
+                    agent,
+                    runtime_strategy: RuntimeCleanupStrategy::FallbackBothRuntimes,
+                })
+                .collect()
+        }
+    }
+}
+
+fn selected_installed_metadata(
+    selector: AgentSelector,
+    installed: &[AgentInstallMetadata],
+) -> Vec<AgentInstallMetadata> {
+    match selector {
+        AgentSelector::All => installed.to_vec(),
+        AgentSelector::One(agent) => installed
+            .iter()
+            .filter(|entry| entry.agent == agent)
+            .cloned()
+            .collect(),
+    }
 }
 
 fn selected_uninstall_agents(selector: AgentSelector) -> Vec<Agent> {
@@ -663,18 +703,6 @@ fn load_optional_install_metadata(paths: &Paths) -> OptionalInstallMetadata {
         Err(NczError::Precondition(message)) => OptionalInstallMetadata::Missing(message),
         Err(NczError::Inconsistent(message)) => OptionalInstallMetadata::Corrupt(message),
         Err(err) => OptionalInstallMetadata::Corrupt(err.to_string()),
-    }
-}
-
-impl OptionalInstallMetadata {
-    fn runtime_for(&self, agent: Agent) -> Option<ContainerRuntime> {
-        match self {
-            Self::Loaded(metadata) => metadata
-                .iter()
-                .find(|entry| entry.agent == agent)
-                .map(|entry| entry.runtime),
-            Self::Missing(_) | Self::Corrupt(_) => None,
-        }
     }
 }
 
@@ -782,16 +810,42 @@ fn cleanup_uninstall_artifacts(
 ) -> Result<(), NczError> {
     let mut failures = Vec::new();
     for target in targets {
-        match target.runtime {
-            Some(ContainerRuntime::Podman) => {
-                cleanup_podman_artifacts(ctx, paths, target.agent, steps, &mut failures);
+        match target.runtime_strategy {
+            RuntimeCleanupStrategy::Declared(ContainerRuntime::Podman) => {
+                cleanup_podman_artifacts(
+                    ctx,
+                    paths,
+                    target.agent,
+                    MissingToolBehavior::Fail,
+                    steps,
+                    &mut failures,
+                );
             }
-            Some(ContainerRuntime::Docker) => {
-                cleanup_docker_artifacts(ctx, target.agent, steps, &mut failures);
+            RuntimeCleanupStrategy::Declared(ContainerRuntime::Docker) => {
+                cleanup_docker_artifacts(
+                    ctx,
+                    target.agent,
+                    MissingToolBehavior::Fail,
+                    steps,
+                    &mut failures,
+                );
             }
-            None => {
-                cleanup_podman_artifacts(ctx, paths, target.agent, steps, &mut failures);
-                cleanup_docker_artifacts(ctx, target.agent, steps, &mut failures);
+            RuntimeCleanupStrategy::FallbackBothRuntimes => {
+                cleanup_podman_artifacts(
+                    ctx,
+                    paths,
+                    target.agent,
+                    MissingToolBehavior::NotFound,
+                    steps,
+                    &mut failures,
+                );
+                cleanup_docker_artifacts(
+                    ctx,
+                    target.agent,
+                    MissingToolBehavior::NotFound,
+                    steps,
+                    &mut failures,
+                );
             }
         }
     }
@@ -813,6 +867,7 @@ fn cleanup_podman_artifacts(
     ctx: &Context,
     paths: &Paths,
     agent: Agent,
+    missing_tool_behavior: MissingToolBehavior,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
@@ -820,7 +875,7 @@ fn cleanup_podman_artifacts(
     let slug = agent.slug();
     let volume = volume_name(agent);
 
-    match probe_command(ctx, "systemctl", &["cat", &unit]) {
+    match probe_command(ctx, "systemctl", &["cat", &unit], missing_tool_behavior) {
         CleanupProbe::Found => {
             record_cleanup_step(
                 steps,
@@ -873,7 +928,12 @@ fn cleanup_podman_artifacts(
         ),
     }
 
-    match probe_command(ctx, "podman", &["container", "exists", slug]) {
+    match probe_command(
+        ctx,
+        "podman",
+        &["container", "exists", slug],
+        missing_tool_behavior,
+    ) {
         CleanupProbe::Found => record_cleanup_step(
             steps,
             failures,
@@ -894,7 +954,12 @@ fn cleanup_podman_artifacts(
         ),
     }
 
-    match probe_command(ctx, "podman", &["volume", "exists", &volume]) {
+    match probe_command(
+        ctx,
+        "podman",
+        &["volume", "exists", &volume],
+        missing_tool_behavior,
+    ) {
         CleanupProbe::Found => record_cleanup_step(
             steps,
             failures,
@@ -919,13 +984,19 @@ fn cleanup_podman_artifacts(
 fn cleanup_docker_artifacts(
     ctx: &Context,
     agent: Agent,
+    missing_tool_behavior: MissingToolBehavior,
     steps: &mut Vec<String>,
     failures: &mut Vec<CleanupFailure>,
 ) {
     let container = docker_container_name(agent);
     let volume = volume_name(agent);
 
-    match probe_command(ctx, "docker", &["container", "inspect", &container]) {
+    match probe_command(
+        ctx,
+        "docker",
+        &["container", "inspect", &container],
+        missing_tool_behavior,
+    ) {
         CleanupProbe::Found => record_cleanup_step(
             steps,
             failures,
@@ -946,7 +1017,12 @@ fn cleanup_docker_artifacts(
         ),
     }
 
-    match probe_command(ctx, "docker", &["volume", "inspect", &volume]) {
+    match probe_command(
+        ctx,
+        "docker",
+        &["volume", "inspect", &volume],
+        missing_tool_behavior,
+    ) {
         CleanupProbe::Found => record_cleanup_step(
             steps,
             failures,
@@ -1007,24 +1083,50 @@ enum CleanupOutcome {
     Failed { reason: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingToolBehavior {
+    Fail,
+    NotFound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupFailure {
     step: String,
     reason: String,
 }
 
-fn probe_command(ctx: &Context, cmd: &str, args: &[&str]) -> CleanupProbe {
+fn probe_command(
+    ctx: &Context,
+    cmd: &str,
+    args: &[&str],
+    missing_tool_behavior: MissingToolBehavior,
+) -> CleanupProbe {
     match ctx.runner.run(cmd, args) {
         Ok(out) if out.ok() => CleanupProbe::Found,
-        Ok(out) if probe_output_is_not_found(cmd, args, out.status, &out.stdout, &out.stderr) => {
-            CleanupProbe::NotFound
+        Ok(out) => {
+            let missing_tool = missing_tool_behavior == MissingToolBehavior::NotFound
+                && probe_output_is_missing_tool(cmd, out.status, &out.stdout, &out.stderr);
+            let not_found =
+                probe_output_is_not_found(cmd, args, out.status, &out.stdout, &out.stderr);
+            if missing_tool || not_found {
+                CleanupProbe::NotFound
+            } else {
+                CleanupProbe::Failed {
+                    reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
+                }
+            }
         }
-        Ok(out) => CleanupProbe::Failed {
-            reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
-        },
-        Err(err) => CleanupProbe::Failed {
-            reason: err.to_string(),
-        },
+        Err(err) => {
+            if missing_tool_behavior == MissingToolBehavior::NotFound
+                && command_error_is_missing_tool(&err, cmd)
+            {
+                CleanupProbe::NotFound
+            } else {
+                CleanupProbe::Failed {
+                    reason: err.to_string(),
+                }
+            }
+        }
     }
 }
 
@@ -1050,6 +1152,9 @@ fn probe_output_is_not_found(
     if status == 125 {
         return false;
     }
+    if probe_output_is_missing_tool(cmd, status, stdout, stderr) {
+        return false;
+    }
 
     let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     if output.contains("permission denied")
@@ -1070,6 +1175,26 @@ fn probe_output_is_not_found(
         ("podman", ["container", "exists", _]) | ("podman", ["volume", "exists", _]) => status == 1,
         ("docker", ["container", "inspect", _]) | ("docker", ["volume", "inspect", _]) => {
             output.contains("not found") || output.contains("no such")
+        }
+        _ => false,
+    }
+}
+
+fn probe_output_is_missing_tool(cmd: &str, status: i32, stdout: &str, stderr: &str) -> bool {
+    if status != 126 && status != 127 {
+        return false;
+    }
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    output.contains("command not found")
+        || output.contains("no such file or directory")
+        || output.contains(&format!("{cmd}: not found"))
+}
+
+fn command_error_is_missing_tool(err: &NczError, expected_cmd: &str) -> bool {
+    match err {
+        NczError::Exec { cmd, msg } if cmd == expected_cmd => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("no such file or directory") || msg.contains("os error 2")
         }
         _ => false,
     }
@@ -1465,6 +1590,27 @@ mod tests {
 
     fn expect_unknown_runtime_cleanup(runner: &FakeRunner, agent: Agent) {
         expect_podman_not_found_cleanup(runner, agent);
+        expect_docker_not_found_cleanup(runner, agent);
+    }
+
+    fn expect_unknown_runtime_cleanup_with_missing_podman_tools(runner: &FakeRunner, agent: Agent) {
+        let unit = service_name(agent);
+        let volume = volume_name(agent);
+        runner.expect(
+            "systemctl",
+            &["cat", &unit],
+            out(127, "", "systemctl: command not found\n"),
+        );
+        runner.expect(
+            "podman",
+            &["container", "exists", agent.slug()],
+            out(127, "", "podman: command not found\n"),
+        );
+        runner.expect(
+            "podman",
+            &["volume", "exists", &volume],
+            out(127, "", "podman: command not found\n"),
+        );
         expect_docker_not_found_cleanup(runner, agent);
     }
 
@@ -1927,7 +2073,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
         for agent in Agent::ALL {
-            expect_unknown_runtime_cleanup(&runner, agent);
+            expect_unknown_runtime_cleanup_with_missing_podman_tools(&runner, agent);
         }
 
         let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false).unwrap();
@@ -1953,6 +2099,42 @@ mod tests {
             .any(|step| step.contains("metadata-remove: agents/install-set.toml already absent")));
         assert!(!paths.agent_install_set().exists());
         assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_all_with_installed_docker_hermes_skips_uninstalled_compiled_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let runner = FakeRunner::new();
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false).unwrap();
+        let report = uninstall_report(report);
+
+        assert!(report.applied);
+        assert_eq!(report.agents, vec!["hermes"]);
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step == "metadata-load: agents/install-set.toml"));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("docker container cleanup: ncz-hermes not found")));
+        assert!(!report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("zeroclaw") || step.contains("openclaw")));
+        assert!(!report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("podman") || step.contains("systemctl")));
+        assert!(!paths.agent_install_set().exists());
         runner.assert_done();
     }
 
@@ -1993,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_single_missing_from_metadata_still_attempts_that_agent_cleanup() {
+    fn uninstall_single_missing_from_metadata_does_not_use_compiled_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         write_test_install_set(
@@ -2001,7 +2183,6 @@ mod tests {
             vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
         );
         let runner = FakeRunner::new();
-        expect_unknown_runtime_cleanup(&runner, Agent::Zeroclaw);
 
         let report = uninstall(
             &ctx(&runner),
@@ -2013,19 +2194,15 @@ mod tests {
         let report = uninstall_report(report);
 
         assert!(report.applied);
-        assert_eq!(report.agents, vec!["zeroclaw"]);
+        assert!(report.agents.is_empty());
         assert!(report
             .planned_steps
             .iter()
             .any(|step| step == "metadata-load: agents/install-set.toml"));
-        assert!(report
+        assert!(!report
             .planned_steps
             .iter()
-            .any(|step| step.contains("podman container cleanup: zeroclaw not found")));
-        assert!(report
-            .planned_steps
-            .iter()
-            .any(|step| step.contains("docker container cleanup: ncz-zeroclaw not found")));
+            .any(|step| step.contains("zeroclaw")));
         assert!(report
             .planned_steps
             .iter()
