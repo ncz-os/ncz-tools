@@ -138,9 +138,9 @@ impl ProfileTarget {
         }
     }
 
-    /// Container runtime expected on this target. macOS goes through Docker
-    /// Desktop / OrbStack; Linux profiles use Podman+systemd-quadlets;
-    /// linux-amd64-generic supports either (operator picks).
+    /// Container runtime expected on this target. macOS stays in V1.0 scope
+    /// via Docker Desktop / OrbStack and a Docker-native install plan; Linux
+    /// profiles use Podman+systemd-quadlets.
     pub fn default_runtime(&self) -> ContainerRuntime {
         match self {
             Self::Rpi5_16gb => ContainerRuntime::Podman,
@@ -151,7 +151,7 @@ impl ProfileTarget {
 }
 
 /// Container runtime — selects between Podman (with systemd quadlets) and
-/// Docker (with `docker run` + manual lifecycle on Mac).
+/// Docker (with `docker run` labels + restart policy, no systemd).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
