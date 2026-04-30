@@ -328,6 +328,14 @@ impl AgentSelector {
             None => Self::All,
         }
     }
+
+    fn from_uninstall_args(all: bool, agent: Option<AgentName>) -> Self {
+        if all {
+            Self::All
+        } else {
+            Self::from_optional(agent)
+        }
+    }
 }
 
 pub fn run(ctx: &Context, action: AgentAction) -> Result<i32, NczError> {
@@ -366,9 +374,12 @@ pub fn run_with_paths(ctx: &Context, paths: &Paths, action: AgentAction) -> Resu
         }
         AgentAction::Status => status(ctx, paths)?,
         AgentAction::Lint { bundle } => lint(ctx, paths, bundle.as_deref())?,
-        AgentAction::Uninstall { agent, full } => {
-            uninstall(ctx, paths, AgentSelector::from_optional(agent), full)?
-        }
+        AgentAction::Uninstall { all, agent, full } => uninstall(
+            ctx,
+            paths,
+            AgentSelector::from_uninstall_args(all, agent),
+            full,
+        )?,
     };
     let code = match &report {
         AgentReport::Lint(r) if r.overall() != Verdict::Approve => 4,
@@ -503,8 +514,9 @@ fn uninstall(
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let plan = uninstall_plan(paths, selector);
+    reject_unsafe_full_uninstall(full, selector, &plan.metadata)?;
     let mut planned_steps = uninstall_metadata_steps(&plan.metadata);
-    cleanup_uninstall_artifacts(ctx, paths, &plan.targets, full, &mut planned_steps);
+    cleanup_uninstall_artifacts(ctx, paths, &plan.targets, full, &mut planned_steps)?;
     remove_uninstall_metadata(paths, selector, &plan.metadata, &mut planned_steps)?;
     Ok(AgentReport::Uninstall(AgentMutationReport {
         schema_version: common::SCHEMA_VERSION,
@@ -600,6 +612,48 @@ fn selected_uninstall_agents(selector: AgentSelector) -> Vec<Agent> {
     match selector {
         AgentSelector::All => Agent::ALL.to_vec(),
         AgentSelector::One(agent) => vec![agent],
+    }
+}
+
+fn reject_unsafe_full_uninstall(
+    full: bool,
+    selector: AgentSelector,
+    metadata: &OptionalInstallMetadata,
+) -> Result<(), NczError> {
+    if !full || matches!(selector, AgentSelector::All) {
+        return Ok(());
+    }
+
+    let retained = retained_metadata_agents_after_uninstall(selector, metadata);
+    let retained_detail = if retained.is_empty() {
+        "the request targets a single agent".to_string()
+    } else {
+        format!(
+            "the request would retain installed agent(s): {}",
+            retained
+                .iter()
+                .map(Agent::slug)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(NczError::Usage(format!(
+        "--full is only allowed when uninstalling all agents because it removes shared /etc/nclawzero/agent-env and providers.d; {retained_detail}. Use `ncz agent uninstall --all --full` for a full wipe, or drop --full to uninstall only the selected agent."
+    )))
+}
+
+fn retained_metadata_agents_after_uninstall(
+    selector: AgentSelector,
+    metadata: &OptionalInstallMetadata,
+) -> Vec<Agent> {
+    let selected = selected_uninstall_agents(selector);
+    match metadata {
+        OptionalInstallMetadata::Loaded(installed) => installed
+            .iter()
+            .filter(|entry| !selected.contains(&entry.agent))
+            .map(|entry| entry.agent)
+            .collect(),
+        OptionalInstallMetadata::Missing(_) | OptionalInstallMetadata::Corrupt(_) => Vec::new(),
     }
 }
 
@@ -725,227 +779,394 @@ fn cleanup_uninstall_artifacts(
     targets: &[UninstallTarget],
     full: bool,
     steps: &mut Vec<String>,
-) {
+) -> Result<(), NczError> {
+    let mut failures = Vec::new();
     for target in targets {
         match target.runtime {
             Some(ContainerRuntime::Podman) => {
-                cleanup_podman_artifacts(ctx, paths, target.agent, steps);
+                cleanup_podman_artifacts(ctx, paths, target.agent, steps, &mut failures);
             }
-            Some(ContainerRuntime::Docker) => cleanup_docker_artifacts(ctx, target.agent, steps),
+            Some(ContainerRuntime::Docker) => {
+                cleanup_docker_artifacts(ctx, target.agent, steps, &mut failures);
+            }
             None => {
-                cleanup_podman_artifacts(ctx, paths, target.agent, steps);
-                cleanup_docker_artifacts(ctx, target.agent, steps);
+                cleanup_podman_artifacts(ctx, paths, target.agent, steps, &mut failures);
+                cleanup_docker_artifacts(ctx, target.agent, steps, &mut failures);
             }
         }
     }
+    if !failures.is_empty() {
+        return Err(cleanup_failure_error(&failures));
+    }
+
     if full {
-        cleanup_full_uninstall_paths(paths, steps);
+        cleanup_full_uninstall_paths(paths, steps, &mut failures);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(cleanup_failure_error(&failures))
     }
 }
 
-fn cleanup_podman_artifacts(ctx: &Context, paths: &Paths, agent: Agent, steps: &mut Vec<String>) {
+fn cleanup_podman_artifacts(
+    ctx: &Context,
+    paths: &Paths,
+    agent: Agent,
+    steps: &mut Vec<String>,
+    failures: &mut Vec<CleanupFailure>,
+) {
     let unit = service_name(agent);
     let slug = agent.slug();
     let volume = volume_name(agent);
 
     match probe_command(ctx, "systemctl", &["cat", &unit]) {
         CleanupProbe::Found => {
-            steps.push(format!(
-                "podman service cleanup: {unit} {}",
-                cleanup_status(ctx, "sudo", &["systemctl", "stop", &unit])
-            ));
-            steps.push(format!(
-                "podman service disable: {unit} {}",
-                cleanup_status(ctx, "sudo", &["systemctl", "disable", &unit])
-            ));
+            record_cleanup_step(
+                steps,
+                failures,
+                format!("podman service cleanup: {unit}"),
+                cleanup_command(ctx, "sudo", &["systemctl", "stop", &unit]),
+            );
+            record_cleanup_step(
+                steps,
+                failures,
+                format!("podman service disable: {unit}"),
+                cleanup_command(ctx, "sudo", &["systemctl", "disable", &unit]),
+            );
         }
-        CleanupProbe::NotFound => {
-            steps.push(format!("podman service cleanup: {unit} not found"));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!("podman service cleanup: {unit} failed: {message}"));
-        }
+        CleanupProbe::NotFound => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman service cleanup: {unit}"),
+            CleanupOutcome::NotFound,
+        ),
+        CleanupProbe::Failed { reason } => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman service cleanup: {unit}"),
+            probe_failed_outcome(reason),
+        ),
     }
 
     let quadlet = paths.agent_quadlet(slug);
     match remove_path_if_present(&quadlet) {
-        CleanupProbe::Found => {
-            steps.push(format!("podman quadlet cleanup: {} removed", quadlet.display()));
-            steps.push(format!(
-                "podman systemd reload: {}",
-                cleanup_status(ctx, "sudo", &["systemctl", "daemon-reload"])
-            ));
+        CleanupOutcome::Removed => {
+            record_cleanup_step(
+                steps,
+                failures,
+                format!("podman quadlet cleanup: {}", quadlet.display()),
+                CleanupOutcome::Removed,
+            );
+            record_cleanup_step(
+                steps,
+                failures,
+                "podman systemd reload",
+                cleanup_command(ctx, "sudo", &["systemctl", "daemon-reload"]),
+            );
         }
-        CleanupProbe::NotFound => {
-            steps.push(format!(
-                "podman quadlet cleanup: {} not found",
-                quadlet.display()
-            ));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!(
-                "podman quadlet cleanup: {} failed: {message}",
-                quadlet.display()
-            ));
-        }
+        outcome => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman quadlet cleanup: {}", quadlet.display()),
+            outcome,
+        ),
     }
 
     match probe_command(ctx, "podman", &["container", "exists", slug]) {
-        CleanupProbe::Found => steps.push(format!(
-            "podman container cleanup: {slug} {}",
-            cleanup_status(ctx, "podman", &["rm", "-f", slug])
-        )),
-        CleanupProbe::NotFound => {
-            steps.push(format!("podman container cleanup: {slug} not found"));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!("podman container cleanup: {slug} failed: {message}"));
-        }
+        CleanupProbe::Found => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman container cleanup: {slug}"),
+            cleanup_command(ctx, "podman", &["rm", "-f", slug]),
+        ),
+        CleanupProbe::NotFound => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman container cleanup: {slug}"),
+            CleanupOutcome::NotFound,
+        ),
+        CleanupProbe::Failed { reason } => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman container cleanup: {slug}"),
+            probe_failed_outcome(reason),
+        ),
     }
 
     match probe_command(ctx, "podman", &["volume", "exists", &volume]) {
-        CleanupProbe::Found => steps.push(format!(
-            "podman volume cleanup: {volume} {}",
-            cleanup_status(ctx, "podman", &["volume", "rm", "-f", &volume])
-        )),
-        CleanupProbe::NotFound => {
-            steps.push(format!("podman volume cleanup: {volume} not found"));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!("podman volume cleanup: {volume} failed: {message}"));
-        }
+        CleanupProbe::Found => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman volume cleanup: {volume}"),
+            cleanup_command(ctx, "podman", &["volume", "rm", "-f", &volume]),
+        ),
+        CleanupProbe::NotFound => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman volume cleanup: {volume}"),
+            CleanupOutcome::NotFound,
+        ),
+        CleanupProbe::Failed { reason } => record_cleanup_step(
+            steps,
+            failures,
+            format!("podman volume cleanup: {volume}"),
+            probe_failed_outcome(reason),
+        ),
     }
 }
 
-fn cleanup_docker_artifacts(ctx: &Context, agent: Agent, steps: &mut Vec<String>) {
+fn cleanup_docker_artifacts(
+    ctx: &Context,
+    agent: Agent,
+    steps: &mut Vec<String>,
+    failures: &mut Vec<CleanupFailure>,
+) {
     let container = docker_container_name(agent);
     let volume = volume_name(agent);
 
     match probe_command(ctx, "docker", &["container", "inspect", &container]) {
-        CleanupProbe::Found => steps.push(format!(
-            "docker container cleanup: {container} {}",
-            cleanup_status(ctx, "docker", &["rm", "-f", &container])
-        )),
-        CleanupProbe::NotFound => {
-            steps.push(format!("docker container cleanup: {container} not found"));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!("docker container cleanup: {container} failed: {message}"));
-        }
+        CleanupProbe::Found => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker container cleanup: {container}"),
+            cleanup_command(ctx, "docker", &["rm", "-f", &container]),
+        ),
+        CleanupProbe::NotFound => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker container cleanup: {container}"),
+            CleanupOutcome::NotFound,
+        ),
+        CleanupProbe::Failed { reason } => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker container cleanup: {container}"),
+            probe_failed_outcome(reason),
+        ),
     }
 
     match probe_command(ctx, "docker", &["volume", "inspect", &volume]) {
-        CleanupProbe::Found => steps.push(format!(
-            "docker volume cleanup: {volume} {}",
-            cleanup_status(ctx, "docker", &["volume", "rm", "-f", &volume])
-        )),
-        CleanupProbe::NotFound => {
-            steps.push(format!("docker volume cleanup: {volume} not found"));
-        }
-        CleanupProbe::Failed(message) => {
-            steps.push(format!("docker volume cleanup: {volume} failed: {message}"));
-        }
+        CleanupProbe::Found => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker volume cleanup: {volume}"),
+            cleanup_command(ctx, "docker", &["volume", "rm", "-f", &volume]),
+        ),
+        CleanupProbe::NotFound => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker volume cleanup: {volume}"),
+            CleanupOutcome::NotFound,
+        ),
+        CleanupProbe::Failed { reason } => record_cleanup_step(
+            steps,
+            failures,
+            format!("docker volume cleanup: {volume}"),
+            probe_failed_outcome(reason),
+        ),
     }
 }
 
-fn cleanup_full_uninstall_paths(paths: &Paths, steps: &mut Vec<String>) {
-    match remove_path_if_present(&paths.agent_env()) {
-        CleanupProbe::Found => steps.push(format!(
-            "full uninstall: remove shared agent-env {} removed",
+fn cleanup_full_uninstall_paths(
+    paths: &Paths,
+    steps: &mut Vec<String>,
+    failures: &mut Vec<CleanupFailure>,
+) {
+    record_cleanup_step(
+        steps,
+        failures,
+        format!(
+            "full uninstall: remove shared agent-env {}",
             paths.agent_env().display()
-        )),
-        CleanupProbe::NotFound => steps.push(format!(
-            "full uninstall: remove shared agent-env {} not found",
-            paths.agent_env().display()
-        )),
-        CleanupProbe::Failed(message) => steps.push(format!(
-            "full uninstall: remove shared agent-env {} failed: {message}",
-            paths.agent_env().display()
-        )),
-    }
-
-    match remove_dir_if_present(&paths.providers_dir()) {
-        CleanupProbe::Found => steps.push(format!(
-            "full uninstall: remove provider data dir {} removed",
+        ),
+        remove_path_if_present(&paths.agent_env()),
+    );
+    record_cleanup_step(
+        steps,
+        failures,
+        format!(
+            "full uninstall: remove provider data dir {}",
             paths.providers_dir().display()
-        )),
-        CleanupProbe::NotFound => steps.push(format!(
-            "full uninstall: remove provider data dir {} not found",
-            paths.providers_dir().display()
-        )),
-        CleanupProbe::Failed(message) => steps.push(format!(
-            "full uninstall: remove provider data dir {} failed: {message}",
-            paths.providers_dir().display()
-        )),
-    }
+        ),
+        remove_dir_if_present(&paths.providers_dir()),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CleanupProbe {
     Found,
     NotFound,
-    Failed(String),
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupOutcome {
+    NotFound,
+    Removed,
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupFailure {
+    step: String,
+    reason: String,
 }
 
 fn probe_command(ctx: &Context, cmd: &str, args: &[&str]) -> CleanupProbe {
     match ctx.runner.run(cmd, args) {
         Ok(out) if out.ok() => CleanupProbe::Found,
-        Ok(_) => CleanupProbe::NotFound,
-        Err(err) => CleanupProbe::Failed(err.to_string()),
+        Ok(out) if probe_output_is_not_found(cmd, args, out.status, &out.stdout, &out.stderr) => {
+            CleanupProbe::NotFound
+        }
+        Ok(out) => CleanupProbe::Failed {
+            reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
+        },
+        Err(err) => CleanupProbe::Failed {
+            reason: err.to_string(),
+        },
     }
 }
 
-fn cleanup_status(ctx: &Context, cmd: &str, args: &[&str]) -> String {
+fn cleanup_command(ctx: &Context, cmd: &str, args: &[&str]) -> CleanupOutcome {
     match ctx.runner.run(cmd, args) {
-        Ok(out) if out.ok() => "removed".to_string(),
-        Ok(out) => format!("failed: {}", cleanup_output_message(out.stdout, out.stderr)),
-        Err(err) => format!("failed: {err}"),
+        Ok(out) if out.ok() => CleanupOutcome::Removed,
+        Ok(out) => CleanupOutcome::Failed {
+            reason: cleanup_output_message(out.status, &out.stdout, &out.stderr),
+        },
+        Err(err) => CleanupOutcome::Failed {
+            reason: err.to_string(),
+        },
     }
 }
 
-fn cleanup_output_message(stdout: String, stderr: String) -> String {
+fn probe_output_is_not_found(
+    cmd: &str,
+    args: &[&str],
+    status: i32,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    if status == 125 {
+        return false;
+    }
+
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if output.contains("permission denied")
+        || output.contains("cannot connect")
+        || output.contains("connection refused")
+        || output.contains("daemon")
+    {
+        return false;
+    }
+
+    match (cmd, args) {
+        ("systemctl", ["cat", _]) => {
+            output.contains("not found")
+                || output.contains("not-found")
+                || output.contains("no files found")
+                || output.contains("no such")
+        }
+        ("podman", ["container", "exists", _]) | ("podman", ["volume", "exists", _]) => status == 1,
+        ("docker", ["container", "inspect", _]) | ("docker", ["volume", "inspect", _]) => {
+            output.contains("not found") || output.contains("no such")
+        }
+        _ => false,
+    }
+}
+
+fn cleanup_output_message(status: i32, stdout: &str, stderr: &str) -> String {
     let message = if stderr.trim().is_empty() {
         stdout.trim().to_string()
     } else {
         stderr.trim().to_string()
     };
     if message.is_empty() {
-        "exit status was non-zero".to_string()
+        format!("exit status {status}")
     } else {
         message
     }
 }
 
-fn remove_path_if_present(path: &std::path::Path) -> CleanupProbe {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {
-            CleanupProbe::Failed("path is a directory".to_string())
-        }
-        Ok(_) => match state::remove_file_durable(path) {
-            Ok(()) => CleanupProbe::Found,
-            Err(err) => CleanupProbe::Failed(err.to_string()),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CleanupProbe::NotFound,
-        Err(err) => CleanupProbe::Failed(err.to_string()),
+fn probe_failed_outcome(reason: String) -> CleanupOutcome {
+    CleanupOutcome::Failed {
+        reason: format!("probe failed: {reason}"),
     }
 }
 
-fn remove_dir_if_present(path: &std::path::Path) -> CleanupProbe {
+fn record_cleanup_step(
+    steps: &mut Vec<String>,
+    failures: &mut Vec<CleanupFailure>,
+    label: impl Into<String>,
+    outcome: CleanupOutcome,
+) {
+    let label = label.into();
+    match outcome {
+        CleanupOutcome::NotFound => steps.push(format!("{label} not found")),
+        CleanupOutcome::Removed => steps.push(format!("{label} removed")),
+        CleanupOutcome::Failed { reason } => {
+            steps.push(format!("{label} failed: {reason}"));
+            failures.push(CleanupFailure {
+                step: label,
+                reason,
+            });
+        }
+    }
+}
+
+fn cleanup_failure_error(failures: &[CleanupFailure]) -> NczError {
+    let details = failures
+        .iter()
+        .map(|failure| format!("{} ({})", failure.step, failure.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    NczError::Inconsistent(format!(
+        "uninstall cleanup failed: {details}; metadata preserved for retry"
+    ))
+}
+
+fn remove_path_if_present(path: &std::path::Path) -> CleanupOutcome {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => CleanupOutcome::Failed {
+            reason: "path is a directory".to_string(),
+        },
+        Ok(_) => match state::remove_file_durable(path) {
+            Ok(()) => CleanupOutcome::Removed,
+            Err(err) => CleanupOutcome::Failed {
+                reason: err.to_string(),
+            },
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CleanupOutcome::NotFound,
+        Err(err) => CleanupOutcome::Failed {
+            reason: err.to_string(),
+        },
+    }
+}
+
+fn remove_dir_if_present(path: &std::path::Path) -> CleanupOutcome {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => match fs::remove_dir_all(path) {
             Ok(()) => {
                 if let Some(parent) = path.parent() {
                     if let Err(err) = std::fs::File::open(parent).and_then(|file| file.sync_all()) {
-                        return CleanupProbe::Failed(err.to_string());
+                        return CleanupOutcome::Failed {
+                            reason: err.to_string(),
+                        };
                     }
                 }
-                CleanupProbe::Found
+                CleanupOutcome::Removed
             }
-            Err(err) => CleanupProbe::Failed(err.to_string()),
+            Err(err) => CleanupOutcome::Failed {
+                reason: err.to_string(),
+            },
         },
-        Ok(_) => CleanupProbe::Failed("path is not a directory".to_string()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CleanupProbe::NotFound,
-        Err(err) => CleanupProbe::Failed(err.to_string()),
+        Ok(_) => CleanupOutcome::Failed {
+            reason: "path is not a directory".to_string(),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CleanupOutcome::NotFound,
+        Err(err) => CleanupOutcome::Failed {
+            reason: err.to_string(),
+        },
     }
 }
 
@@ -1805,9 +2026,10 @@ mod tests {
             .planned_steps
             .iter()
             .any(|step| step.contains("docker container cleanup: ncz-zeroclaw not found")));
-        assert!(report.planned_steps.iter().any(|step| {
-            step.contains("metadata-remove: agents/install-set.toml unchanged")
-        }));
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("metadata-remove: agents/install-set.toml unchanged")));
         let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
         assert_eq!(metadata_agents(&installed), vec!["hermes"]);
         assert!(paths.lock_path.exists());
@@ -1853,6 +2075,167 @@ mod tests {
         let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
         assert_eq!(metadata_agents(&installed), vec!["zeroclaw"]);
         assert!(agent_install_metadata::read(&paths, Agent::Hermes).is_err());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_single_full_rejects_when_other_agents_retained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![
+                test_metadata(Agent::Zeroclaw, ContainerRuntime::Docker),
+                test_metadata(Agent::Openclaw, ContainerRuntime::Docker),
+                test_metadata(Agent::Hermes, ContainerRuntime::Docker),
+            ],
+        );
+        std::fs::create_dir_all(paths.providers_dir()).unwrap();
+        std::fs::write(paths.agent_env(), "OPENAI_API_KEY=test\n").unwrap();
+        let runner = FakeRunner::new();
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Usage(message)
+                if message.contains("--full is only allowed when uninstalling all agents")
+                    && message.contains("zeroclaw, openclaw")
+                    && message.contains("ncz agent uninstall --all --full")
+                    && message.contains("drop --full")
+        ));
+        let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
+        assert_eq!(
+            metadata_agents(&installed),
+            vec!["zeroclaw", "openclaw", "hermes"]
+        );
+        assert!(paths.agent_env().exists());
+        assert!(paths.providers_dir().exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_preserves_metadata_when_cleanup_probe_reports_daemon_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let runner = FakeRunner::new();
+        let container = docker_container_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        runner.expect(
+            "docker",
+            &["container", "inspect", &container],
+            out(125, "", "Cannot connect to Docker daemon\n"),
+        );
+        runner.expect(
+            "docker",
+            &["volume", "inspect", &volume],
+            out(1, "", "not found\n"),
+        );
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("docker container cleanup: ncz-hermes")
+                    && message.contains("Cannot connect to Docker daemon")
+                    && message.contains("metadata preserved for retry")
+        ));
+        let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
+        assert_eq!(metadata_agents(&installed), vec!["hermes"]);
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_preserves_metadata_when_cleanup_removal_reports_permission_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let runner = FakeRunner::new();
+        let container = docker_container_name(Agent::Hermes);
+        let volume = volume_name(Agent::Hermes);
+        runner.expect(
+            "docker",
+            &["container", "inspect", &container],
+            out(0, "", ""),
+        );
+        runner.expect(
+            "docker",
+            &["rm", "-f", &container],
+            out(1, "", "permission denied\n"),
+        );
+        runner.expect(
+            "docker",
+            &["volume", "inspect", &volume],
+            out(1, "", "not found\n"),
+        );
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Inconsistent(message)
+                if message.contains("docker container cleanup: ncz-hermes")
+                    && message.contains("permission denied")
+                    && message.contains("metadata preserved for retry")
+        ));
+        let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
+        assert_eq!(metadata_agents(&installed), vec!["hermes"]);
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_all_not_found_cleanup_removes_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
+        let runner = FakeRunner::new();
+        expect_docker_not_found_cleanup(&runner, Agent::Hermes);
+
+        let report = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+        )
+        .unwrap();
+        let report = uninstall_report(report);
+
+        assert!(report.applied);
+        assert_eq!(report.agents, vec!["hermes"]);
+        assert!(report
+            .planned_steps
+            .iter()
+            .any(|step| step.contains("docker container cleanup: ncz-hermes not found")));
+        assert!(!paths.agent_install_set().exists());
         runner.assert_done();
     }
 
