@@ -12,14 +12,16 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use serde::{ser::SerializeStruct, Serialize};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::agent_spec::{
     Agent, AgentSpec, ContainerRuntime, ImageSource, ProfileTarget, SandboxKind, SpecError, Variant,
 };
-use crate::cli::{AgentAction, Context};
+use crate::cli::{AgentAction, AgentName, Context};
 use crate::cmd::common;
 use crate::error::NczError;
 use crate::output::{self, Render};
+use crate::state::agent_install_metadata::{self, AgentInstallMetadata, PENDING_IMAGE_DIGEST};
 use crate::state::{self, Paths};
 
 #[derive(Debug, Serialize)]
@@ -81,6 +83,7 @@ pub struct AgentMutationReport {
     pub schema_version: u32,
     pub action: String,
     pub agents: Vec<String>,
+    pub planned_steps: Vec<String>,
     pub applied: bool,
 }
 
@@ -90,7 +93,14 @@ impl Render for AgentMutationReport {
             w,
             "agent {}: agents={:?} applied={}",
             self.action, self.agents, self.applied
-        )
+        )?;
+        if !self.planned_steps.is_empty() {
+            writeln!(w, "planned steps:")?;
+            for step in &self.planned_steps {
+                writeln!(w, "  - {step}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -98,11 +108,18 @@ impl Render for AgentMutationReport {
 #[non_exhaustive]
 pub struct AgentStatusReport {
     pub schema_version: u32,
+    pub planned_steps: Vec<String>,
     pub agents: Vec<AgentStatusEntry>,
 }
 
 impl Render for AgentStatusReport {
     fn render_text(&self, w: &mut dyn Write) -> io::Result<()> {
+        if !self.planned_steps.is_empty() {
+            writeln!(w, "planned steps:")?;
+            for step in &self.planned_steps {
+                writeln!(w, "  - {step}")?;
+            }
+        }
         writeln!(w, "{:14} {:10} {:10} PORT", "AGENT", "SANDBOX", "STATE")?;
         for entry in &self.agents {
             writeln!(
@@ -138,13 +155,14 @@ impl Serialize for AgentLintReport {
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("AgentLintReport", 6)?;
+        let mut state = serializer.serialize_struct("AgentLintReport", 7)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("bundle_path", &self.bundle_path)?;
         state.serialize_field("invariants_checked", &self.invariants_checked)?;
         state.serialize_field("invariants_passed", &self.invariants_passed)?;
         state.serialize_field("results", &self.results)?;
         state.serialize_field("overall", &self.overall())?;
+        state.serialize_field("overall_message", &self.overall_message())?;
         state.end()
     }
 }
@@ -172,7 +190,10 @@ impl Render for AgentLintReport {
                 result.evidence.as_deref().unwrap_or("-")
             )?;
         }
-        writeln!(w, "verdict: {}", self.overall())
+        match self.overall_message() {
+            Some(message) => writeln!(w, "verdict: {} ({message})", self.overall()),
+            None => writeln!(w, "verdict: {}", self.overall()),
+        }
     }
 }
 
@@ -196,7 +217,14 @@ impl AgentLintReport {
         Self::verdict_for_results(&self.results)
     }
 
+    pub fn overall_message(&self) -> Option<&'static str> {
+        Self::verdict_message_for_results(&self.results)
+    }
+
     pub fn verdict_for_results(results: &[InvariantResult]) -> Verdict {
+        if results.is_empty() {
+            return Verdict::Incomplete;
+        }
         if results
             .iter()
             .any(|result| result.status == InvariantStatus::Fail)
@@ -209,6 +237,14 @@ impl AgentLintReport {
             Verdict::Warn
         } else {
             Verdict::Approve
+        }
+    }
+
+    pub fn verdict_message_for_results(results: &[InvariantResult]) -> Option<&'static str> {
+        if results.is_empty() {
+            Some("no invariants checked - parser failed or invariant set missing")
+        } else {
+            None
         }
     }
 }
@@ -225,6 +261,7 @@ pub struct InvariantResult {
 #[serde(rename_all = "kebab-case")]
 pub enum InvariantStatus {
     Pass,
+    Skip,
     Warn,
     Fail,
 }
@@ -233,6 +270,7 @@ impl fmt::Display for InvariantStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Pass => "pass",
+            Self::Skip => "skip",
             Self::Warn => "warn",
             Self::Fail => "fail",
         };
@@ -246,6 +284,7 @@ pub enum Verdict {
     Approve,
     Warn,
     Reject,
+    Incomplete,
 }
 
 impl fmt::Display for Verdict {
@@ -254,8 +293,24 @@ impl fmt::Display for Verdict {
             Self::Approve => "approve",
             Self::Warn => "warn",
             Self::Reject => "reject",
+            Self::Incomplete => "incomplete",
         };
         f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSelector {
+    All,
+    One(Agent),
+}
+
+impl AgentSelector {
+    fn from_optional(agent: Option<AgentName>) -> Self {
+        match agent {
+            Some(agent) => Self::One(agent.into_agent()),
+            None => Self::All,
+        }
     }
 }
 
@@ -281,17 +336,22 @@ pub fn run_with_paths(ctx: &Context, paths: &Paths, action: AgentAction) -> Resu
             &from,
             dry_run,
         )?,
-        AgentAction::Enable { agent } => mutate(ctx, paths, "enable", &[agent])?,
-        AgentAction::Disable { agent } => mutate(ctx, paths, "disable", &[agent])?,
+        AgentAction::Enable { agent } => {
+            mutate(ctx, paths, "enable", AgentSelector::One(agent.into_agent()))?
+        }
+        AgentAction::Disable { agent } => mutate(
+            ctx,
+            paths,
+            "disable",
+            AgentSelector::One(agent.into_agent()),
+        )?,
         AgentAction::Reload { agent } => {
-            let agents = agent.map(|a| vec![a]).unwrap_or_default();
-            mutate(ctx, paths, "reload", &agents)?
+            mutate(ctx, paths, "reload", AgentSelector::from_optional(agent))?
         }
         AgentAction::Status => status(ctx, paths)?,
         AgentAction::Lint { bundle } => lint(ctx, paths, bundle.as_deref())?,
         AgentAction::Uninstall { agent, full } => {
-            let agents = agent.map(|a| vec![a]).unwrap_or_default();
-            uninstall(ctx, paths, &agents, full)?
+            uninstall(ctx, paths, AgentSelector::from_optional(agent), full)?
         }
     };
     let code = match &report {
@@ -327,39 +387,49 @@ fn install(
     };
     spec.validate()
         .map_err(|e: SpecError| NczError::Precondition(e.to_string()))?;
-    let _lock = if dry_run {
-        None
-    } else {
-        Some(state::acquire_lock(&paths.lock_path)?)
-    };
 
     // V1.0 scaffold: planned-steps emission + dry-run support; the actual
     // OCI-pull / runtime-specific laydown / enable cycle is the next
-    // implementation slice. The shape (plan -> apply, convergent steps,
-    // hash-verified images) is locked here; bodies fill in.
+    // implementation slice. Install metadata is still persisted so later
+    // lifecycle operations keep the same Podman-vs-Docker split selected at
+    // install time.
     let planned_steps = planned_steps_for(&spec);
+    if !dry_run {
+        let _lock = state::acquire_lock(&paths.lock_path)?;
+        persist_install_metadata(paths, &spec)?;
+    }
 
-    Err(NczError::Precondition(format!(
-        "agent install scaffold — bodies pending. spec={spec:?} dry_run={dry_run} planned={planned_steps:?}"
-    )))
+    Ok(AgentReport::Install(AgentInstallReport {
+        schema_version: common::SCHEMA_VERSION,
+        spec,
+        planned_steps,
+        applied: !dry_run,
+        dry_run,
+    }))
 }
 
 fn mutate(
     _ctx: &Context,
     paths: &Paths,
     action: &str,
-    agents: &[String],
+    selector: AgentSelector,
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
+    let metadata = load_metadata_for_selector(paths, selector)?;
+    let planned_steps = lifecycle_planned_steps(action, &metadata);
+    let agents = metadata_agents(&metadata);
     Err(NczError::Precondition(format!(
-        "agent {action} — bodies pending. agents={agents:?}"
+        "agent {action} scaffold — bodies pending. agents={agents:?} planned={planned_steps:?}"
     )))
 }
 
-fn status(_ctx: &Context, _paths: &Paths) -> Result<AgentReport, NczError> {
-    Err(NczError::Precondition(
-        "agent status — bodies pending".to_string(),
-    ))
+fn status(_ctx: &Context, paths: &Paths) -> Result<AgentReport, NczError> {
+    let _lock = state::acquire_lock(&paths.lock_path)?;
+    let metadata = load_metadata_for_selector(paths, AgentSelector::All)?;
+    let planned_steps = status_planned_steps(&metadata);
+    Err(NczError::Precondition(format!(
+        "agent status scaffold — bodies pending. planned={planned_steps:?}"
+    )))
 }
 
 fn lint(
@@ -378,13 +448,53 @@ fn lint(
 fn uninstall(
     _ctx: &Context,
     paths: &Paths,
-    agents: &[String],
+    selector: AgentSelector,
     full: bool,
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
+    let metadata = load_metadata_for_selector(paths, selector)?;
+    let planned_steps = uninstall_planned_steps(&metadata, full);
+    let agents = metadata_agents(&metadata);
     Err(NczError::Precondition(format!(
-        "agent uninstall — bodies pending. agents={agents:?} full={full}"
+        "agent uninstall scaffold — bodies pending. agents={agents:?} full={full} planned={planned_steps:?}"
     )))
+}
+
+fn persist_install_metadata(paths: &Paths, spec: &AgentSpec) -> Result<(), NczError> {
+    let installed_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|err| {
+        NczError::Precondition(format!("could not format install timestamp: {err}"))
+    })?;
+    for agent in spec.variant.agents() {
+        agent_install_metadata::write(
+            paths,
+            &AgentInstallMetadata {
+                agent,
+                profile: spec.profile,
+                runtime: spec.profile.default_runtime(),
+                sandbox: spec.sandbox,
+                installed_at: installed_at.clone(),
+                image_digest: PENDING_IMAGE_DIGEST.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn load_metadata_for_selector(
+    paths: &Paths,
+    selector: AgentSelector,
+) -> Result<Vec<AgentInstallMetadata>, NczError> {
+    match selector {
+        AgentSelector::All => agent_install_metadata::read_all_installed(paths),
+        AgentSelector::One(agent) => agent_install_metadata::read(paths, agent).map(|m| vec![m]),
+    }
+}
+
+fn metadata_agents(metadata: &[AgentInstallMetadata]) -> Vec<String> {
+    metadata
+        .iter()
+        .map(|entry| entry.agent.slug().to_string())
+        .collect()
 }
 
 fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
@@ -417,7 +527,105 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
         }
     }
     steps.push("convergent verify: skip writes for unchanged artifacts (per F-3)".to_string());
+    steps.push(format!(
+        "metadata-write: persist install metadata for {agent_count} agent(s) under agents/<agent>/install-metadata.toml"
+    ));
     steps
+}
+
+fn lifecycle_planned_steps(action: &str, metadata: &[AgentInstallMetadata]) -> Vec<String> {
+    let mut steps = metadata_load_steps(metadata);
+    for entry in metadata {
+        steps.push(match (action, entry.runtime) {
+            ("enable", ContainerRuntime::Podman) => {
+                format!("systemctl enable --now {}", service_name(entry.agent))
+            }
+            ("enable", ContainerRuntime::Docker) => {
+                format!("docker start {}", docker_container_name(entry.agent))
+            }
+            ("disable", ContainerRuntime::Podman) => {
+                format!("systemctl stop + mask {}", service_name(entry.agent))
+            }
+            ("disable", ContainerRuntime::Docker) => {
+                format!("docker stop {}", docker_container_name(entry.agent))
+            }
+            ("reload", ContainerRuntime::Podman) => {
+                format!(
+                    "podman image refresh + systemctl restart {}",
+                    service_name(entry.agent)
+                )
+            }
+            ("reload", ContainerRuntime::Docker) => {
+                format!(
+                    "docker image refresh + docker restart {}",
+                    docker_container_name(entry.agent)
+                )
+            }
+            (other, runtime) => {
+                format!("unsupported lifecycle action {other} for runtime {runtime:?}")
+            }
+        });
+    }
+    steps
+}
+
+fn uninstall_planned_steps(metadata: &[AgentInstallMetadata], full: bool) -> Vec<String> {
+    let mut steps = metadata_load_steps(metadata);
+    for entry in metadata {
+        steps.push(match entry.runtime {
+            ContainerRuntime::Podman => format!(
+                "systemctl stop {} + remove quadlet + podman rm",
+                service_name(entry.agent)
+            ),
+            ContainerRuntime::Docker => {
+                format!("docker rm -f {}", docker_container_name(entry.agent))
+            }
+        });
+        steps.push(format!(
+            "metadata-remove: agents/{}/install-metadata.toml",
+            entry.agent.slug()
+        ));
+    }
+    if full {
+        steps.push("full uninstall: remove shared agent-env and provider data dirs".to_string());
+    }
+    steps
+}
+
+fn status_planned_steps(metadata: &[AgentInstallMetadata]) -> Vec<String> {
+    let mut steps = metadata_load_steps(metadata);
+    for entry in metadata {
+        steps.push(match entry.runtime {
+            ContainerRuntime::Podman => {
+                format!("systemctl is-active {}", service_name(entry.agent))
+            }
+            ContainerRuntime::Docker => format!(
+                "docker container inspect --format {{{{.State.Status}}}} {}",
+                docker_container_name(entry.agent)
+            ),
+        });
+    }
+    steps
+}
+
+fn metadata_load_steps(metadata: &[AgentInstallMetadata]) -> Vec<String> {
+    metadata
+        .iter()
+        .map(|entry| {
+            format!(
+                "metadata-load: agents/{}/install-metadata.toml",
+                entry.agent.slug()
+            )
+        })
+        .collect()
+}
+
+fn service_name(agent: Agent) -> String {
+    format!("{}.service", agent.slug())
+}
+
+fn docker_container_name(agent: Agent) -> String {
+    format!("ncz-{}", agent.slug())
 }
 
 fn image_source_step(source: &ImageSource) -> String {
@@ -453,16 +661,12 @@ fn parse_variant(s: &str) -> Result<Variant, NczError> {
         return Ok(Variant::Triple);
     }
     if let Some(name) = s.strip_prefix("single=") {
-        let agent = match name {
-            "zeroclaw" => Agent::Zeroclaw,
-            "openclaw" => Agent::Openclaw,
-            "hermes" => Agent::Hermes,
-            other => {
-                return Err(NczError::Usage(format!(
-                    "unknown agent '{other}'; expected one of: zeroclaw, openclaw, hermes"
-                )));
-            }
-        };
+        common::validate_agent(name)?;
+        let agent = Agent::from_slug(name).ok_or_else(|| {
+            NczError::Usage(format!(
+                "unknown agent '{name}'; expected one of: zeroclaw, openclaw, hermes"
+            ))
+        })?;
         return Ok(Variant::Single { agent });
     }
     Err(NczError::Usage(format!(
@@ -545,6 +749,24 @@ mod tests {
             statement: "test invariant".to_string(),
             evidence: Some("test evidence".to_string()),
         }
+    }
+
+    fn test_metadata(agent: Agent, runtime: ContainerRuntime) -> AgentInstallMetadata {
+        AgentInstallMetadata {
+            agent,
+            profile: match runtime {
+                ContainerRuntime::Podman => ProfileTarget::Rpi5_16gb,
+                ContainerRuntime::Docker => ProfileTarget::MacosArm64Docker,
+            },
+            runtime,
+            sandbox: SandboxKind::OpenShell,
+            installed_at: "2026-04-30T00:00:00Z".to_string(),
+            image_digest: PENDING_IMAGE_DIGEST.to_string(),
+        }
+    }
+
+    fn write_test_metadata(paths: &Paths, agent: Agent, runtime: ContainerRuntime) {
+        agent_install_metadata::write(paths, &test_metadata(agent, runtime)).unwrap();
     }
 
     #[test]
@@ -633,7 +855,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
 
-        let err = install(
+        let report = install(
             &ctx(&runner),
             &paths,
             Some("macos-arm64-docker"),
@@ -642,14 +864,20 @@ mod tests {
             "tarball=/tmp/hermes.tar",
             true,
         )
-        .unwrap_err();
+        .unwrap();
 
-        match err {
-            NczError::Precondition(message) => {
-                assert!(message.contains("image_source: Tarball"));
-                assert!(message.contains("/tmp/hermes.tar"));
+        match report {
+            AgentReport::Install(report) => {
+                assert_eq!(
+                    report.spec.image_source,
+                    ImageSource::Tarball {
+                        path: PathBuf::from("/tmp/hermes.tar")
+                    }
+                );
+                assert!(!report.applied);
+                assert!(report.dry_run);
             }
-            other => panic!("expected precondition scaffold error, got {other:?}"),
+            other => panic!("expected install report, got {other:?}"),
         }
     }
 
@@ -670,7 +898,10 @@ mod tests {
             .iter()
             .any(|step| step.starts_with("systemctl daemon-reload")));
         assert!(!steps.iter().any(|step| step.starts_with("docker run:")));
-        assert!(steps.last().unwrap().starts_with("convergent verify:"));
+        assert!(steps
+            .iter()
+            .any(|step| step.starts_with("convergent verify:")));
+        assert!(steps.last().unwrap().starts_with("metadata-write:"));
     }
 
     #[test]
@@ -693,7 +924,22 @@ mod tests {
         assert!(!steps
             .iter()
             .any(|step| step.starts_with("systemctl daemon-reload")));
-        assert!(steps.last().unwrap().starts_with("convergent verify:"));
+        assert!(steps
+            .iter()
+            .any(|step| step.starts_with("convergent verify:")));
+        assert!(steps.last().unwrap().starts_with("metadata-write:"));
+    }
+
+    #[test]
+    fn install_plan_writes_metadata_as_final_step() {
+        let spec = test_spec(ProfileTarget::LinuxAmd64Generic);
+        let steps = planned_steps_for(&spec);
+
+        assert!(steps.last().unwrap().contains("metadata-write"));
+        assert!(steps
+            .last()
+            .unwrap()
+            .contains("agents/<agent>/install-metadata.toml"));
     }
 
     #[test]
@@ -720,47 +966,88 @@ mod tests {
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
 
-        let err = run_with_paths(
+        let report = install(
             &ctx(&runner),
             &paths,
-            AgentAction::Install {
-                profile: Some("rpi5-16gb".to_string()),
-                variant: "triple".to_string(),
-                sandbox: "openshell".to_string(),
-                from: "registry".to_string(),
-                dry_run: true,
-            },
+            Some("rpi5-16gb"),
+            "triple",
+            "openshell",
+            "registry",
+            true,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(err, NczError::Precondition(_)));
+        assert!(matches!(
+            report,
+            AgentReport::Install(AgentInstallReport {
+                applied: false,
+                dry_run: true,
+                ..
+            })
+        ));
         assert!(!paths.lock_path.exists());
         assert!(!paths.lock_path.parent().unwrap().exists());
+        assert!(!paths.agent_install_metadata(Agent::Zeroclaw).exists());
+    }
+
+    #[test]
+    fn install_persists_metadata_after_planning_when_not_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+
+        let report = install(
+            &ctx(&runner),
+            &paths,
+            Some("macos-arm64-docker"),
+            "single=hermes",
+            "naked",
+            "registry",
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            report,
+            AgentReport::Install(AgentInstallReport {
+                applied: true,
+                dry_run: false,
+                ..
+            })
+        ));
+        assert!(paths.lock_path.exists());
+        let metadata = agent_install_metadata::read(&paths, Agent::Hermes).unwrap();
+        assert_eq!(
+            metadata,
+            AgentInstallMetadata {
+                agent: Agent::Hermes,
+                profile: ProfileTarget::MacosArm64Docker,
+                runtime: ContainerRuntime::Docker,
+                sandbox: SandboxKind::Naked,
+                installed_at: metadata.installed_at.clone(),
+                image_digest: PENDING_IMAGE_DIGEST.to_string(),
+            }
+        );
+        assert!(metadata.installed_at.ends_with('Z'));
     }
 
     #[test]
     fn mutating_agent_actions_acquire_lock() {
         for action in [
-            AgentAction::Install {
-                profile: Some("rpi5-16gb".to_string()),
-                variant: "triple".to_string(),
-                sandbox: "openshell".to_string(),
-                from: "registry".to_string(),
-                dry_run: false,
-            },
             AgentAction::Enable {
-                agent: "zeroclaw".to_string(),
+                agent: AgentName::from(Agent::Zeroclaw),
             },
             AgentAction::Disable {
-                agent: "zeroclaw".to_string(),
+                agent: AgentName::from(Agent::Zeroclaw),
             },
             AgentAction::Reload {
-                agent: Some("zeroclaw".to_string()),
+                agent: Some(AgentName::from(Agent::Zeroclaw)),
             },
             AgentAction::Uninstall {
-                agent: Some("zeroclaw".to_string()),
+                agent: Some(AgentName::from(Agent::Zeroclaw)),
                 full: false,
             },
+            AgentAction::Status,
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let paths = test_paths(tmp.path());
@@ -774,18 +1061,163 @@ mod tests {
     }
 
     #[test]
-    fn read_only_agent_actions_do_not_acquire_lock() {
-        for action in [AgentAction::Status, AgentAction::Lint { bundle: None }] {
-            let tmp = tempfile::tempdir().unwrap();
-            let paths = test_paths(tmp.path());
-            let runner = FakeRunner::new();
+    fn install_non_dry_run_acquires_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
 
-            let err = run_with_paths(&ctx(&runner), &paths, action).unwrap_err();
+        let report = install(
+            &ctx(&runner),
+            &paths,
+            Some("rpi5-16gb"),
+            "triple",
+            "openshell",
+            "registry",
+            false,
+        )
+        .unwrap();
 
-            assert!(matches!(err, NczError::Precondition(_)));
-            assert!(!paths.lock_path.exists());
-            assert!(!paths.lock_path.parent().unwrap().exists());
-        }
+        assert!(matches!(
+            report,
+            AgentReport::Install(AgentInstallReport {
+                applied: true,
+                dry_run: false,
+                ..
+            })
+        ));
+        assert!(paths.lock_path.exists());
+    }
+
+    #[test]
+    fn lint_does_not_acquire_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+
+        let err =
+            run_with_paths(&ctx(&runner), &paths, AgentAction::Lint { bundle: None }).unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert!(!paths.lock_path.exists());
+        assert!(!paths.lock_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn lifecycle_single_selector_fails_cleanly_when_metadata_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            AgentAction::Enable {
+                agent: AgentName::from(Agent::Zeroclaw),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("missing install metadata for zeroclaw")
+                    && message.contains("reinstall with `ncz agent install`")
+        ));
+        assert!(paths.lock_path.exists());
+    }
+
+    #[test]
+    fn lifecycle_all_selector_fails_cleanly_when_no_metadata_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+
+        let err =
+            run_with_paths(&ctx(&runner), &paths, AgentAction::Reload { agent: None }).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("no agent install metadata found")
+                    && message.contains("reinstall with `ncz agent install`")
+        ));
+        assert!(paths.lock_path.exists());
+    }
+
+    #[test]
+    fn all_selector_loads_installed_metadata_while_single_loads_one_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_metadata(&paths, Agent::Zeroclaw, ContainerRuntime::Docker);
+        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Podman);
+
+        let single = load_metadata_for_selector(&paths, AgentSelector::One(Agent::Hermes)).unwrap();
+        assert_eq!(metadata_agents(&single), vec!["hermes"]);
+
+        let all = load_metadata_for_selector(&paths, AgentSelector::All).unwrap();
+        assert_eq!(metadata_agents(&all), vec!["zeroclaw", "hermes"]);
+    }
+
+    #[test]
+    fn docker_profile_lifecycle_uses_docker_branch_from_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Docker);
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            AgentAction::Disable {
+                agent: AgentName::from(Agent::Hermes),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("metadata-load: agents/hermes/install-metadata.toml")
+                    && message.contains("docker stop ncz-hermes")
+                    && !message.contains("systemctl stop")
+        ));
+    }
+
+    #[test]
+    fn all_selector_lifecycle_branches_per_agent_metadata_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        write_test_metadata(&paths, Agent::Zeroclaw, ContainerRuntime::Docker);
+        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Podman);
+
+        let err =
+            run_with_paths(&ctx(&runner), &paths, AgentAction::Reload { agent: None }).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("docker restart ncz-zeroclaw")
+                    && message.contains("systemctl restart hermes.service")
+        ));
+    }
+
+    #[test]
+    fn status_loads_metadata_under_lock_and_uses_docker_status_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        write_test_metadata(&paths, Agent::Openclaw, ContainerRuntime::Docker);
+
+        let err = run_with_paths(&ctx(&runner), &paths, AgentAction::Status).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("metadata-load: agents/openclaw/install-metadata.toml")
+                    && message.contains("docker container inspect")
+        ));
+        assert!(paths.lock_path.exists());
     }
 
     #[test]
@@ -800,6 +1232,35 @@ mod tests {
 
         assert_eq!(report.overall(), Verdict::Approve);
         assert_eq!(report.invariants_checked, 2);
+        assert_eq!(report.invariants_passed, 2);
+    }
+
+    #[test]
+    fn lint_verdict_incomplete_when_no_invariants_checked() {
+        let report = AgentLintReport::from_results("bundle".to_string(), vec![]);
+
+        assert_eq!(report.overall(), Verdict::Incomplete);
+        assert_eq!(
+            report.overall_message(),
+            Some("no invariants checked - parser failed or invariant set missing")
+        );
+        assert_eq!(report.invariants_checked, 0);
+        assert_eq!(report.invariants_passed, 0);
+    }
+
+    #[test]
+    fn lint_verdict_approves_passes_with_skipped_invariants() {
+        let report = AgentLintReport::from_results(
+            "bundle".to_string(),
+            vec![
+                invariant(InvariantStatus::Pass),
+                invariant(InvariantStatus::Skip),
+                invariant(InvariantStatus::Pass),
+            ],
+        );
+
+        assert_eq!(report.overall(), Verdict::Approve);
+        assert_eq!(report.invariants_checked, 3);
         assert_eq!(report.invariants_passed, 2);
     }
 

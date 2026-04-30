@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod agent_env;
+pub mod agent_install_metadata;
 pub mod backup;
 pub mod channel;
 pub mod mcp;
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{flock, FlockOperation};
 use tempfile::NamedTempFile;
 
+use crate::agent_spec::Agent;
 use crate::error::NczError;
 
 /// Default base directories. Tests construct a `Paths` with a sandbox root.
@@ -72,6 +74,11 @@ impl Paths {
     }
     pub fn agent_primary_provider(&self, agent: &str) -> PathBuf {
         self.agent_config_dir().join(agent).join("primary-provider")
+    }
+    pub fn agent_install_metadata(&self, agent: Agent) -> PathBuf {
+        self.agent_config_dir()
+            .join(agent.slug())
+            .join("install-metadata.toml")
     }
     pub fn sandbox_dir(&self) -> PathBuf {
         self.etc_dir.join("sandbox")

@@ -11,6 +11,8 @@
 //! Pattern precedent: GRAEAE consult v1.0 recommended this shape over
 //! arbitrary user-provided profiles for a fleet of <10 known device types.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// One of the three nclawzero agents. Each carries an OCI image reference
@@ -25,6 +27,8 @@ pub enum Agent {
 }
 
 impl Agent {
+    pub const ALL: [Self; 3] = [Self::Zeroclaw, Self::Openclaw, Self::Hermes];
+
     /// Stable lower-kebab tag used for paths, env files, and quadlet names.
     pub fn slug(&self) -> &'static str {
         match self {
@@ -43,6 +47,21 @@ impl Agent {
             Self::Openclaw => 18789,
             Self::Hermes => 8642,
         }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "zeroclaw" => Some(Self::Zeroclaw),
+            "openclaw" => Some(Self::Openclaw),
+            "hermes" => Some(Self::Hermes),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.slug())
     }
 }
 
@@ -230,6 +249,15 @@ mod tests {
         assert_eq!(Agent::Zeroclaw.slug(), "zeroclaw");
         assert_eq!(Agent::Openclaw.slug(), "openclaw");
         assert_eq!(Agent::Hermes.slug(), "hermes");
+    }
+
+    #[test]
+    fn agent_slugs_parse_back_to_typed_agents() {
+        for agent in Agent::ALL {
+            assert_eq!(Agent::from_slug(agent.slug()), Some(agent));
+        }
+        assert_eq!(Agent::from_slug("zeroclaw2"), None);
+        assert_eq!(Agent::from_slug("../../../etc"), None);
     }
 
     #[test]
