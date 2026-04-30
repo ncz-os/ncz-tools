@@ -464,6 +464,12 @@ const CORRUPT_METADATA_PRESERVED_MESSAGE: &str = concat!(
     "To force-recover, run ncz agent uninstall --force-recover-from-corrupt."
 );
 
+const FORCE_RECOVER_FROM_CORRUPT_REQUIRES_ALL_MESSAGE: &str = concat!(
+    "force-recover-from-corrupt requires --all selector to avoid orphaning non-selected agents. ",
+    "Either run uninstall --all --force-recover-from-corrupt, or use ncz agent reinstall <agent> ",
+    "if you only need to recover one agent."
+);
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn apply_install(paths: &Paths, spec: AgentSpec) -> Result<AgentInstallReport, NczError> {
     let planned_steps = planned_steps_for(&spec);
@@ -626,6 +632,12 @@ fn uninstall_plan(
     selector: AgentSelector,
     force_recover_from_corrupt: bool,
 ) -> Result<UninstallPlan, NczError> {
+    if force_recover_from_corrupt && !matches!(selector, AgentSelector::All) {
+        return Err(NczError::Usage(
+            FORCE_RECOVER_FROM_CORRUPT_REQUIRES_ALL_MESSAGE.to_string(),
+        ));
+    }
+
     let metadata = load_optional_install_metadata(paths);
     if matches!(metadata, OptionalInstallMetadata::Corrupt(_)) && !force_recover_from_corrupt {
         return Err(corrupt_metadata_preserved_error());
@@ -2314,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_force_recover_from_corrupt_backs_up_and_removes_metadata() {
+    fn uninstall_force_recover_from_corrupt_all_backs_up_and_removes_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         write_test_install_set(
@@ -2326,20 +2338,15 @@ mod tests {
             .replacen("schema_version = 1", "schema_version = 999", 1);
         std::fs::write(paths.agent_install_set(), &raw).unwrap();
         let runner = FakeRunner::new();
-        expect_unknown_runtime_cleanup(&runner, Agent::Hermes);
+        for agent in Agent::ALL {
+            expect_unknown_runtime_cleanup(&runner, agent);
+        }
 
-        let report = uninstall(
-            &ctx(&runner),
-            &paths,
-            AgentSelector::One(Agent::Hermes),
-            false,
-            true,
-        )
-        .unwrap();
+        let report = uninstall(&ctx(&runner), &paths, AgentSelector::All, false, true).unwrap();
         let report = uninstall_report(report);
 
         assert!(report.applied);
-        assert_eq!(report.agents, vec!["hermes"]);
+        assert_eq!(report.agents, vec!["zeroclaw", "openclaw", "hermes"]);
         assert!(report.planned_steps.iter().any(|step| {
             step.contains("metadata-force-recover: backed up corrupt agents/install-set.toml")
         }));
@@ -2361,6 +2368,52 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), raw);
+        assert!(paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn uninstall_force_recover_from_corrupt_one_rejects_to_preserve_install_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_test_install_set(
+            &paths,
+            vec![
+                test_metadata(Agent::Zeroclaw, ContainerRuntime::Docker),
+                test_metadata(Agent::Hermes, ContainerRuntime::Docker),
+            ],
+        );
+        let raw = std::fs::read_to_string(paths.agent_install_set())
+            .unwrap()
+            .replacen("schema_version = 1", "schema_version = 999", 1);
+        std::fs::write(paths.agent_install_set(), &raw).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = uninstall(
+            &ctx(&runner),
+            &paths,
+            AgentSelector::One(Agent::Hermes),
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Usage(message)
+                if message == FORCE_RECOVER_FROM_CORRUPT_REQUIRES_ALL_MESSAGE
+        ));
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_install_set()).unwrap(),
+            raw
+        );
+        assert!(std::fs::read_dir(paths.agent_config_dir())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("install-set.toml.corrupt-backup-")));
         assert!(paths.lock_path.exists());
         runner.assert_done();
     }
