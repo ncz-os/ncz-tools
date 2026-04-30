@@ -4,6 +4,7 @@
 //! `pi-gen-nclawzero/stage-zeroclaw/06-install-ncz-cli/`. See
 //! `pi-gen-nclawzero/NCZ-CLI-DESIGN.md` for the operator-facing surface.
 
+pub mod agent_spec;
 pub mod cli;
 pub mod cmd;
 pub mod error;

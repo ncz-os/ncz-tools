@@ -10,6 +10,7 @@ use crate::error::NczError;
 
 mod common;
 
+pub mod agent;
 pub mod api;
 pub mod backup;
 pub mod channel;
@@ -46,6 +47,7 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<i32, NczError> {
         Command::Models { action } => models::run(ctx, action),
         Command::Sessions { action } => sessions::run(ctx, action),
         Command::Mcp { action } => mcp::run(ctx, action),
+        Command::Agent { action } => agent::run(ctx, action),
         Command::Backup { action } => backup::run(ctx, action),
         Command::Cron { action } => cron::run(ctx, action),
         Command::Sandbox { action } => sandbox::run(ctx, action),
