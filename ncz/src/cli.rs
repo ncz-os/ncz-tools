@@ -73,6 +73,16 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Install, enable, and disable agents in the local sandbox stack.
+    ///
+    /// New surface (v0.5+) replacing the per-agent flow of `set-agent` /
+    /// `restart` / `pause` / `resume`. Drives `ncz agent install` (lay down
+    /// quadlets + load OCI images), `ncz agent enable` / `disable`, and
+    /// `ncz agent lint` (read-only invariant check before laydown).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Create, verify, and restore host-side nclawzero backups.
     Backup {
         #[command(subcommand)]
@@ -294,6 +304,81 @@ pub enum McpAction {
     Remove { name: String },
     /// Show an MCP server declaration.
     Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentAction {
+    /// Install one or more agents on the local host (pulls OCI images,
+    /// drops quadlets, enables systemd units).
+    ///
+    /// Refuses to install bundles that violate `agents/INVARIANTS.md` —
+    /// hard refusal, no override flag. For diagnostics on a non-compliant
+    /// bundle without installing it, use `ncz agent lint`.
+    #[non_exhaustive]
+    Install {
+        /// Target profile (rpi5-16gb, linux-amd64-generic, macos-arm64-docker).
+        /// When omitted, the tool auto-detects the current host.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Variant: `triple` (zeroclaw + openclaw + hermes) or
+        /// `single=<agent>` for a single-agent deployment.
+        #[arg(long, default_value = "triple")]
+        variant: String,
+        /// Sandbox kind: `naked` (Podman default runtime) or `openshell`
+        /// (NemoClaw-pattern wrapped image with policy enforcement).
+        #[arg(long, default_value = "openshell")]
+        sandbox: String,
+        /// OCI image source: `registry` (default), `fleet-cache=<path>`,
+        /// or `tarball=<path>`.
+        #[arg(long, default_value = "registry")]
+        from: String,
+        /// Plan only — print what would be done without writing or starting
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Enable an installed agent (start its systemd unit).
+    #[non_exhaustive]
+    Enable {
+        /// Agent name (zeroclaw|openclaw|hermes).
+        agent: String,
+    },
+    /// Disable an installed agent (stop and mask its systemd unit; keeps
+    /// the OCI image and quadlet files in place for re-enable).
+    #[non_exhaustive]
+    Disable {
+        /// Agent name.
+        agent: String,
+    },
+    /// Reload an agent (re-pull image, restart unit). Used after an OCI
+    /// image bump in the catalog.
+    #[non_exhaustive]
+    Reload {
+        /// Agent name; omit to reload all installed agents.
+        agent: Option<String>,
+    },
+    /// Show installed agents + their state (running, stopped, failed).
+    Status,
+    /// Lint a wrapper bundle against `agents/INVARIANTS.md` without
+    /// installing. Reports per-invariant pass/fail/warning. Read-only.
+    #[non_exhaustive]
+    Lint {
+        /// Path to the agent bundle directory (containing manifest.yaml,
+        /// policy-additions.yaml, etc.). Omit to lint the active bundle.
+        #[arg(long)]
+        bundle: Option<std::path::PathBuf>,
+    },
+    /// Uninstall an agent — removes systemd units, quadlets, podman
+    /// containers and volumes, agent-images. Idempotent.
+    #[non_exhaustive]
+    Uninstall {
+        /// Agent name; omit to uninstall all.
+        agent: Option<String>,
+        /// Also remove `/etc/nclawzero/agent-env` and provider data dirs.
+        /// Default leaves them for re-install.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
