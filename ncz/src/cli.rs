@@ -354,8 +354,8 @@ pub enum AgentAction {
         /// (NemoClaw-pattern wrapped image with policy enforcement).
         #[arg(long, default_value = "openshell")]
         sandbox: String,
-        /// OCI image source: `registry` (default), `fleet-cache=<path>`,
-        /// or `tarball=<path>`.
+        /// OCI image source: `registry` (default),
+        /// `fleet-cache=<absolute-path>`, or `tarball=<absolute-path>`.
         #[arg(long, default_value = "registry")]
         from: String,
         /// Plan only — print what would be done without writing or starting
