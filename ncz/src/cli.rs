@@ -412,6 +412,10 @@ pub enum AgentAction {
         /// continue with fallback cleanup.
         #[arg(long)]
         force_recover_from_corrupt: bool,
+        /// Operator opt-in recovery for legacy fallback cleanup: allow
+        /// deletion of same-named runtime volumes without nclawzero labels.
+        #[arg(long)]
+        destructive_recovery: bool,
     },
 }
 
@@ -463,6 +467,7 @@ mod tests {
                     agent: None,
                     full: false,
                     force_recover_from_corrupt: false,
+                    destructive_recovery: false,
                 },
         } = uninstall.command
         else {
@@ -478,19 +483,16 @@ mod tests {
                     agent: None,
                     full: true,
                     force_recover_from_corrupt: false,
+                    destructive_recovery: false,
                 },
         } = uninstall.command
         else {
             panic!("expected explicit agent uninstall all");
         };
 
-        let uninstall = Cli::try_parse_from([
-            "ncz",
-            "agent",
-            "uninstall",
-            "--force-recover-from-corrupt",
-        ])
-        .unwrap();
+        let uninstall =
+            Cli::try_parse_from(["ncz", "agent", "uninstall", "--force-recover-from-corrupt"])
+                .unwrap();
         let Command::Agent {
             action:
                 AgentAction::Uninstall {
@@ -498,10 +500,27 @@ mod tests {
                     agent: None,
                     full: false,
                     force_recover_from_corrupt: true,
+                    destructive_recovery: false,
                 },
         } = uninstall.command
         else {
             panic!("expected corrupt metadata force recovery flag");
+        };
+
+        let uninstall =
+            Cli::try_parse_from(["ncz", "agent", "uninstall", "--destructive-recovery"]).unwrap();
+        let Command::Agent {
+            action:
+                AgentAction::Uninstall {
+                    all: false,
+                    agent: None,
+                    full: false,
+                    force_recover_from_corrupt: false,
+                    destructive_recovery: true,
+                },
+        } = uninstall.command
+        else {
+            panic!("expected destructive recovery flag");
         };
     }
 
