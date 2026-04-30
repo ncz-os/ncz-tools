@@ -21,7 +21,10 @@ use crate::cli::{AgentAction, AgentName, Context};
 use crate::cmd::common;
 use crate::error::NczError;
 use crate::output::{self, Render};
-use crate::state::agent_install_metadata::{self, AgentInstallMetadata, PENDING_IMAGE_DIGEST};
+use crate::state::agent_install_metadata::{
+    self, AgentInstallMetadata, AGENT_INSTALL_METADATA_SCHEMA_VERSION, PENDING_IMAGE_DIGEST,
+    PENDING_IMAGE_REFERENCE,
+};
 use crate::state::{self, Paths};
 
 #[derive(Debug, Serialize)]
@@ -230,6 +233,11 @@ impl AgentLintReport {
             .any(|result| result.status == InvariantStatus::Fail)
         {
             Verdict::Reject
+        } else if !results
+            .iter()
+            .any(|result| result.status == InvariantStatus::Pass)
+        {
+            Verdict::Incomplete
         } else if results
             .iter()
             .any(|result| result.status == InvariantStatus::Warn)
@@ -243,6 +251,14 @@ impl AgentLintReport {
     pub fn verdict_message_for_results(results: &[InvariantResult]) -> Option<&'static str> {
         if results.is_empty() {
             Some("no invariants checked - parser failed or invariant set missing")
+        } else if !results
+            .iter()
+            .any(|result| result.status == InvariantStatus::Pass)
+            && !results
+                .iter()
+                .any(|result| result.status == InvariantStatus::Fail)
+        {
+            Some("no invariants passed - invariant set yielded no passing evidence")
         } else {
             None
         }
@@ -416,6 +432,9 @@ fn mutate(
 ) -> Result<AgentReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let metadata = load_metadata_for_selector(paths, selector)?;
+    if action == "reload" {
+        reject_tarball_reload_without_from(&metadata)?;
+    }
     let planned_steps = lifecycle_planned_steps(action, &metadata);
     let agents = metadata_agents(&metadata);
     Err(NczError::Precondition(format!(
@@ -464,18 +483,34 @@ fn persist_install_metadata(paths: &Paths, spec: &AgentSpec) -> Result<(), NczEr
     let installed_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|err| {
         NczError::Precondition(format!("could not format install timestamp: {err}"))
     })?;
-    for agent in spec.variant.agents() {
-        agent_install_metadata::write(
-            paths,
-            &AgentInstallMetadata {
-                agent,
-                profile: spec.profile,
-                runtime: spec.profile.default_runtime(),
-                sandbox: spec.sandbox,
-                installed_at: installed_at.clone(),
-                image_digest: PENDING_IMAGE_DIGEST.to_string(),
-            },
-        )?;
+    let metadata = spec
+        .variant
+        .agents()
+        .into_iter()
+        .map(|agent| AgentInstallMetadata {
+            schema_version: AGENT_INSTALL_METADATA_SCHEMA_VERSION,
+            agent,
+            profile: spec.profile,
+            runtime: spec.profile.default_runtime(),
+            sandbox: spec.sandbox,
+            installed_at: installed_at.clone(),
+            image_source: spec.image_source.clone(),
+            image_reference: PENDING_IMAGE_REFERENCE.to_string(),
+            image_digest: PENDING_IMAGE_DIGEST.to_string(),
+        })
+        .collect();
+    agent_install_metadata::write_install_set(paths, metadata)
+}
+
+fn reject_tarball_reload_without_from(metadata: &[AgentInstallMetadata]) -> Result<(), NczError> {
+    for entry in metadata {
+        if let ImageSource::Tarball { path } = &entry.image_source {
+            return Err(NczError::Precondition(format!(
+                "cannot reload {} from tarball {}: tarball is one-shot, re-run install with new --from",
+                entry.agent,
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -528,7 +563,7 @@ fn planned_steps_for(spec: &AgentSpec) -> Vec<String> {
     }
     steps.push("convergent verify: skip writes for unchanged artifacts (per F-3)".to_string());
     steps.push(format!(
-        "metadata-write: persist install metadata for {agent_count} agent(s) under agents/<agent>/install-metadata.toml"
+        "metadata-write: atomically persist install set for {agent_count} agent(s) at agents/install-set.toml"
     ));
     steps
 }
@@ -551,13 +586,15 @@ fn lifecycle_planned_steps(action: &str, metadata: &[AgentInstallMetadata]) -> V
             }
             ("reload", ContainerRuntime::Podman) => {
                 format!(
-                    "podman image refresh + systemctl restart {}",
+                    "{} + systemctl restart {}",
+                    reload_image_source_step(entry),
                     service_name(entry.agent)
                 )
             }
             ("reload", ContainerRuntime::Docker) => {
                 format!(
-                    "docker image refresh + docker restart {}",
+                    "{} + docker restart {}",
+                    reload_image_source_step(entry),
                     docker_container_name(entry.agent)
                 )
             }
@@ -582,7 +619,7 @@ fn uninstall_planned_steps(metadata: &[AgentInstallMetadata], full: bool) -> Vec
             }
         });
         steps.push(format!(
-            "metadata-remove: agents/{}/install-metadata.toml",
+            "metadata-remove: agents/install-set.toml entry for {}",
             entry.agent.slug()
         ));
     }
@@ -609,15 +646,11 @@ fn status_planned_steps(metadata: &[AgentInstallMetadata]) -> Vec<String> {
 }
 
 fn metadata_load_steps(metadata: &[AgentInstallMetadata]) -> Vec<String> {
-    metadata
-        .iter()
-        .map(|entry| {
-            format!(
-                "metadata-load: agents/{}/install-metadata.toml",
-                entry.agent.slug()
-            )
-        })
-        .collect()
+    if metadata.is_empty() {
+        Vec::new()
+    } else {
+        vec!["metadata-load: agents/install-set.toml".to_string()]
+    }
 }
 
 fn service_name(agent: Agent) -> String {
@@ -626,6 +659,29 @@ fn service_name(agent: Agent) -> String {
 
 fn docker_container_name(agent: Agent) -> String {
     format!("ncz-{}", agent.slug())
+}
+
+fn reload_image_source_step(entry: &AgentInstallMetadata) -> String {
+    match &entry.image_source {
+        ImageSource::Registry => format!("{} registry image refresh", runtime_slug(entry.runtime)),
+        ImageSource::FleetCache { path } => format!(
+            "{} fleet-cache image refresh from {}",
+            runtime_slug(entry.runtime),
+            path.display()
+        ),
+        ImageSource::Tarball { path } => format!(
+            "{} tarball image refresh from {}",
+            runtime_slug(entry.runtime),
+            path.display()
+        ),
+    }
+}
+
+fn runtime_slug(runtime: ContainerRuntime) -> &'static str {
+    match runtime {
+        ContainerRuntime::Podman => "podman",
+        ContainerRuntime::Docker => "docker",
+    }
 }
 
 fn image_source_step(source: &ImageSource) -> String {
@@ -752,7 +808,16 @@ mod tests {
     }
 
     fn test_metadata(agent: Agent, runtime: ContainerRuntime) -> AgentInstallMetadata {
+        test_metadata_with_source(agent, runtime, ImageSource::Registry)
+    }
+
+    fn test_metadata_with_source(
+        agent: Agent,
+        runtime: ContainerRuntime,
+        image_source: ImageSource,
+    ) -> AgentInstallMetadata {
         AgentInstallMetadata {
+            schema_version: AGENT_INSTALL_METADATA_SCHEMA_VERSION,
             agent,
             profile: match runtime {
                 ContainerRuntime::Podman => ProfileTarget::Rpi5_16gb,
@@ -761,12 +826,14 @@ mod tests {
             runtime,
             sandbox: SandboxKind::OpenShell,
             installed_at: "2026-04-30T00:00:00Z".to_string(),
+            image_source,
+            image_reference: PENDING_IMAGE_REFERENCE.to_string(),
             image_digest: PENDING_IMAGE_DIGEST.to_string(),
         }
     }
 
-    fn write_test_metadata(paths: &Paths, agent: Agent, runtime: ContainerRuntime) {
-        agent_install_metadata::write(paths, &test_metadata(agent, runtime)).unwrap();
+    fn write_test_install_set(paths: &Paths, metadata: Vec<AgentInstallMetadata>) {
+        agent_install_metadata::write_install_set(paths, metadata).unwrap();
     }
 
     #[test]
@@ -936,10 +1003,7 @@ mod tests {
         let steps = planned_steps_for(&spec);
 
         assert!(steps.last().unwrap().contains("metadata-write"));
-        assert!(steps
-            .last()
-            .unwrap()
-            .contains("agents/<agent>/install-metadata.toml"));
+        assert!(steps.last().unwrap().contains("agents/install-set.toml"));
     }
 
     #[test]
@@ -987,7 +1051,7 @@ mod tests {
         ));
         assert!(!paths.lock_path.exists());
         assert!(!paths.lock_path.parent().unwrap().exists());
-        assert!(!paths.agent_install_metadata(Agent::Zeroclaw).exists());
+        assert!(!paths.agent_install_set().exists());
     }
 
     #[test]
@@ -1016,19 +1080,64 @@ mod tests {
             })
         ));
         assert!(paths.lock_path.exists());
+        assert!(paths.agent_install_set().exists());
         let metadata = agent_install_metadata::read(&paths, Agent::Hermes).unwrap();
         assert_eq!(
             metadata,
             AgentInstallMetadata {
+                schema_version: AGENT_INSTALL_METADATA_SCHEMA_VERSION,
                 agent: Agent::Hermes,
                 profile: ProfileTarget::MacosArm64Docker,
                 runtime: ContainerRuntime::Docker,
                 sandbox: SandboxKind::Naked,
                 installed_at: metadata.installed_at.clone(),
+                image_source: ImageSource::Registry,
+                image_reference: PENDING_IMAGE_REFERENCE.to_string(),
                 image_digest: PENDING_IMAGE_DIGEST.to_string(),
             }
         );
         assert!(metadata.installed_at.ends_with('Z'));
+    }
+
+    #[test]
+    fn reinstall_replaces_authoritative_install_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+
+        install(
+            &ctx(&runner),
+            &paths,
+            Some("macos-arm64-docker"),
+            "triple",
+            "naked",
+            "registry",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata_agents(&agent_install_metadata::read_all_installed(&paths).unwrap()),
+            vec!["zeroclaw", "openclaw", "hermes"]
+        );
+
+        install(
+            &ctx(&runner),
+            &paths,
+            Some("macos-arm64-docker"),
+            "single=hermes",
+            "naked",
+            "registry",
+            false,
+        )
+        .unwrap();
+
+        let installed = agent_install_metadata::read_all_installed(&paths).unwrap();
+        assert_eq!(metadata_agents(&installed), vec!["hermes"]);
+        assert!(agent_install_metadata::read(&paths, Agent::Zeroclaw).is_err());
+        let body = std::fs::read_to_string(paths.agent_install_set()).unwrap();
+        assert!(!body.contains("zeroclaw"));
+        assert!(!body.contains("openclaw"));
+        assert!(body.contains("hermes"));
     }
 
     #[test]
@@ -1148,8 +1257,13 @@ mod tests {
     fn all_selector_loads_installed_metadata_while_single_loads_one_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        write_test_metadata(&paths, Agent::Zeroclaw, ContainerRuntime::Docker);
-        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Podman);
+        write_test_install_set(
+            &paths,
+            vec![
+                test_metadata(Agent::Zeroclaw, ContainerRuntime::Docker),
+                test_metadata(Agent::Hermes, ContainerRuntime::Podman),
+            ],
+        );
 
         let single = load_metadata_for_selector(&paths, AgentSelector::One(Agent::Hermes)).unwrap();
         assert_eq!(metadata_agents(&single), vec!["hermes"]);
@@ -1163,7 +1277,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
-        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Docker);
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Hermes, ContainerRuntime::Docker)],
+        );
 
         let err = run_with_paths(
             &ctx(&runner),
@@ -1177,7 +1294,7 @@ mod tests {
         assert!(matches!(
             err,
             NczError::Precondition(message)
-                if message.contains("metadata-load: agents/hermes/install-metadata.toml")
+                if message.contains("metadata-load: agents/install-set.toml")
                     && message.contains("docker stop ncz-hermes")
                     && !message.contains("systemctl stop")
         ));
@@ -1188,8 +1305,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
-        write_test_metadata(&paths, Agent::Zeroclaw, ContainerRuntime::Docker);
-        write_test_metadata(&paths, Agent::Hermes, ContainerRuntime::Podman);
+        write_test_install_set(
+            &paths,
+            vec![
+                test_metadata(Agent::Zeroclaw, ContainerRuntime::Docker),
+                test_metadata(Agent::Hermes, ContainerRuntime::Podman),
+            ],
+        );
 
         let err =
             run_with_paths(&ctx(&runner), &paths, AgentAction::Reload { agent: None }).unwrap_err();
@@ -1203,18 +1325,141 @@ mod tests {
     }
 
     #[test]
+    fn reload_uses_persisted_registry_and_fleet_cache_sources() {
+        for (image_source, expected) in [
+            (
+                ImageSource::Registry,
+                "podman registry image refresh + systemctl restart hermes.service",
+            ),
+            (
+                ImageSource::FleetCache {
+                    path: PathBuf::from("/mnt/argonas/agent-images"),
+                },
+                "podman fleet-cache image refresh from /mnt/argonas/agent-images + systemctl restart hermes.service",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = test_paths(tmp.path());
+            let runner = FakeRunner::new();
+            write_test_install_set(
+                &paths,
+                vec![test_metadata_with_source(
+                    Agent::Hermes,
+                    ContainerRuntime::Podman,
+                    image_source,
+                )],
+            );
+
+            let err = run_with_paths(
+                &ctx(&runner),
+                &paths,
+                AgentAction::Reload {
+                    agent: Some(AgentName::from(Agent::Hermes)),
+                },
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                err,
+                NczError::Precondition(message)
+                    if message.contains("metadata-load: agents/install-set.toml")
+                        && message.contains(expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn reload_rejects_tarball_source_without_new_from_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        write_test_install_set(
+            &paths,
+            vec![test_metadata_with_source(
+                Agent::Hermes,
+                ContainerRuntime::Docker,
+                ImageSource::Tarball {
+                    path: PathBuf::from("/tmp/hermes.tar"),
+                },
+            )],
+        );
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            AgentAction::Reload {
+                agent: Some(AgentName::from(Agent::Hermes)),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NczError::Precondition(message)
+                if message.contains("cannot reload hermes from tarball /tmp/hermes.tar")
+                    && message.contains("tarball is one-shot, re-run install with new --from")
+        ));
+    }
+
+    #[test]
+    fn install_persists_image_source_in_metadata() {
+        for (from, expected) in [
+            ("registry", ImageSource::Registry),
+            (
+                "fleet-cache=/mnt/argonas/agent-images",
+                ImageSource::FleetCache {
+                    path: PathBuf::from("/mnt/argonas/agent-images"),
+                },
+            ),
+            (
+                "tarball=/tmp/hermes.tar",
+                ImageSource::Tarball {
+                    path: PathBuf::from("/tmp/hermes.tar"),
+                },
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = test_paths(tmp.path());
+            let runner = FakeRunner::new();
+
+            install(
+                &ctx(&runner),
+                &paths,
+                Some("macos-arm64-docker"),
+                "single=hermes",
+                "naked",
+                from,
+                false,
+            )
+            .unwrap();
+
+            let metadata = agent_install_metadata::read(&paths, Agent::Hermes).unwrap();
+            assert_eq!(
+                metadata.schema_version,
+                AGENT_INSTALL_METADATA_SCHEMA_VERSION
+            );
+            assert_eq!(metadata.image_source, expected);
+            assert_eq!(metadata.image_reference, PENDING_IMAGE_REFERENCE);
+            assert_eq!(metadata.image_digest, PENDING_IMAGE_DIGEST);
+        }
+    }
+
+    #[test]
     fn status_loads_metadata_under_lock_and_uses_docker_status_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
-        write_test_metadata(&paths, Agent::Openclaw, ContainerRuntime::Docker);
+        write_test_install_set(
+            &paths,
+            vec![test_metadata(Agent::Openclaw, ContainerRuntime::Docker)],
+        );
 
         let err = run_with_paths(&ctx(&runner), &paths, AgentAction::Status).unwrap_err();
 
         assert!(matches!(
             err,
             NczError::Precondition(message)
-                if message.contains("metadata-load: agents/openclaw/install-metadata.toml")
+                if message.contains("metadata-load: agents/install-set.toml")
                     && message.contains("docker container inspect")
         ));
         assert!(paths.lock_path.exists());
@@ -1246,6 +1491,51 @@ mod tests {
         );
         assert_eq!(report.invariants_checked, 0);
         assert_eq!(report.invariants_passed, 0);
+    }
+
+    #[test]
+    fn lint_verdict_table_covers_pass_skip_warn_fail_combinations() {
+        let cases: &[(&str, &[InvariantStatus], Verdict, u32)] = &[
+            ("empty", &[], Verdict::Incomplete, 0),
+            ("all-pass", &[InvariantStatus::Pass], Verdict::Approve, 1),
+            (
+                "pass+skip",
+                &[InvariantStatus::Pass, InvariantStatus::Skip],
+                Verdict::Approve,
+                1,
+            ),
+            ("all-skip", &[InvariantStatus::Skip], Verdict::Incomplete, 0),
+            (
+                "warn-only",
+                &[InvariantStatus::Warn],
+                Verdict::Incomplete,
+                0,
+            ),
+            (
+                "skip+warn",
+                &[InvariantStatus::Skip, InvariantStatus::Warn],
+                Verdict::Incomplete,
+                0,
+            ),
+            ("fail-only", &[InvariantStatus::Fail], Verdict::Reject, 0),
+            (
+                "skip+fail",
+                &[InvariantStatus::Skip, InvariantStatus::Fail],
+                Verdict::Reject,
+                0,
+            ),
+        ];
+
+        for (name, statuses, expected_verdict, expected_passed) in cases {
+            let report = AgentLintReport::from_results(
+                (*name).to_string(),
+                statuses.iter().copied().map(invariant).collect(),
+            );
+
+            assert_eq!(report.overall(), *expected_verdict, "{name}");
+            assert_eq!(report.invariants_checked, statuses.len() as u32, "{name}");
+            assert_eq!(report.invariants_passed, *expected_passed, "{name}");
+        }
     }
 
     #[test]
