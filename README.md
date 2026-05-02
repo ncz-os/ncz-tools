@@ -1,5 +1,16 @@
 # ncz-tools
 
+## ⚠️ Status: Alpha / experimental
+
+> This project is part of the nclawzero claw-family experimental set
+> (alongside [zterm](https://gitlab.com/perlowja/zterm),
+> [ncz-tools](https://gitlab.com/nclawzero/ncz-tools), and
+> [zcon](https://gitlab.com/nclawzero/zcon)). It is **unfinished and
+> not yet recommended for production use**. Interfaces, file formats,
+> and behavior may change without notice.
+
+---
+
 Operator tooling for the nclawzero edge fleet. Cargo workspace housing the
 Rust binaries that get installed on every nclawzero device and on the
 operator workstations that drive them.
