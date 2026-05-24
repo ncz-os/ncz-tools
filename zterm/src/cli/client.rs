@@ -304,13 +304,49 @@ impl ZeroclawClient {
     }
 
     /// Put configuration
+    ///
+    /// `/api/config` uses an envelope contract: the GET returns
+    /// `{ "content": "<toml string>" }` (see `fetch_config_toml`);
+    /// PUT mirror expects the same envelope. Previously this PUT a
+    /// raw JSON `Config` object — the daemon rejected or silently
+    /// misinterpreted the body. Fetches current TOML, updates
+    /// `[agent].provider` + `[agent].model` in place, PUTs back the
+    /// `{ content: <toml> }` envelope.
     pub async fn put_config(&self, config: &Config) -> Result<()> {
+        let current_toml = self.fetch_config_toml().await?;
+        let mut doc: toml::Value = toml::from_str(&current_toml)
+            .map_err(|e| anyhow!("Failed to parse current /api/config TOML: {}", e))?;
+        let agent_entry = doc
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("/api/config TOML root is not a table"))?
+            .entry("agent".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        let agent_tbl = agent_entry
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("[agent] is not a TOML table"))?;
+        agent_tbl.insert(
+            "provider".to_string(),
+            toml::Value::String(config.agent.provider.clone()),
+        );
+        agent_tbl.insert(
+            "model".to_string(),
+            toml::Value::String(config.agent.model.clone()),
+        );
+        let updated_toml = toml::to_string(&doc)
+            .map_err(|e| anyhow!("Failed to serialise updated TOML: {}", e))?;
+
+        #[derive(serde::Serialize)]
+        struct PutEnvelope<'a> {
+            content: &'a str,
+        }
+        let body = PutEnvelope { content: &updated_toml };
+
         let url = format!("{}/api/config", self.base_url);
         let res = self
             .http_client
             .put(&url)
             .bearer_auth(&self.token)
-            .json(config)
+            .json(&body)
             .send()
             .await
             .map_err(|e| anyhow!(ClientError::Network(e.to_string())))?;
@@ -674,7 +710,19 @@ impl ZeroclawClient {
             "model": model
         });
 
-        let response = match self.http_client.post(&url).json(&payload).send().await {
+        // bearer_auth applied to match every other endpoint on this
+        // Client (chat, config, models, sessions, memory). Previously
+        // /webhook posts went unauthenticated, and the response parse
+        // ignored HTTP status — so auth failures + gateway errors
+        // surfaced as "Failed to parse response" instead of themselves.
+        let response = match self
+            .http_client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let wrapped = anyhow!("Webhook request failed: {}", e);
@@ -682,6 +730,20 @@ impl ZeroclawClient {
                 return Err(wrapped);
             }
         };
+
+        // Check HTTP status BEFORE JSON parse so auth / 5xx surfaces
+        // as itself instead of generic 'Failed to parse response'.
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let wrapped = anyhow!(
+                "Webhook returned HTTP {}: {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            );
+            self.emit_failure(&wrapped);
+            return Err(wrapped);
+        }
 
         let json: serde_json::Value = match response.json().await {
             Ok(j) => j,
@@ -751,24 +813,21 @@ impl ZeroclawClient {
     // ===== MODEL MANAGEMENT =====
 
     /// Update default model
+    ///
+    /// Delegates to `put_config` so `/models set` uses the same
+    /// envelope contract `/api/config` expects + propagates the same
+    /// per-status error mapping. Previously this PUT a JSON `Config`
+    /// object AND returned `Ok(())` regardless of HTTP status, so
+    /// `/models set` reported success even when the daemon rejected
+    /// the update.
     pub async fn set_model(&self, provider: &str, model: &str) -> Result<()> {
-        let url = format!("{}/api/config", self.base_url);
         let config = Config {
             agent: AgentConfig {
                 provider: provider.to_string(),
                 model: model.to_string(),
             },
         };
-
-        self.http_client
-            .put(&url)
-            .bearer_auth(&self.token)
-            .json(&config)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to set model: {}", e))?;
-
-        Ok(())
+        self.put_config(&config).await
     }
 
     /// List available models for a provider
