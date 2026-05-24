@@ -47,23 +47,37 @@ pub async fn run(
     let config_content = storage::load_config()?;
     let config: toml::Value = toml::from_str(&config_content)?;
 
-    // Extract API endpoint and token
-    let gateway_url = remote.unwrap_or_else(|| {
-        config
-            .get("gateway")
-            .and_then(|v| v.get("url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:8888")
-            .to_string()
-    });
+    // Extract API endpoint and token. Resolution order (README and
+    // .env.example document ZEROCLAW_URL / ZEROCLAW_TOKEN as
+    // supported, but previously only --remote/--token + config.toml
+    // were consulted — a dotenv-loaded deployment relying on those
+    // env vars silently fell back to local config or the hard-coded
+    // default, which itself was port 8888 and conflicts with the
+    // documented zeroclaw daemon port 42617):
+    //   1. CLI flag (--remote / --token)
+    //   2. Environment variable (ZEROCLAW_URL / ZEROCLAW_TOKEN)
+    //   3. Config file [gateway].url / [gateway].token
+    //   4. Hard default (http://localhost:42617)
+    let gateway_url = remote
+        .or_else(|| std::env::var("ZEROCLAW_URL").ok())
+        .unwrap_or_else(|| {
+            config
+                .get("gateway")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://localhost:42617")
+                .to_string()
+        });
 
-    let api_token = token.or_else(|| {
-        config
-            .get("gateway")
-            .and_then(|v| v.get("token"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let api_token = token
+        .or_else(|| std::env::var("ZEROCLAW_TOKEN").ok())
+        .or_else(|| {
+            config
+                .get("gateway")
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
     // Peek at ~/.zterm/config.toml's [[workspaces]] before the legacy
     // pairing flow. If multi-workspace mode is configured, each
