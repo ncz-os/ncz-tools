@@ -42,7 +42,10 @@ pub enum Commands {
         #[arg(long)]
         session_name: Option<String>,
 
-        /// Remote gateway URL (default: http://localhost:8888)
+        /// Remote gateway URL (default: http://localhost:42617).
+        ///
+        /// Resolution order: this flag → ZEROCLAW_URL env var →
+        /// [gateway].url in config.toml → http://localhost:42617.
         #[arg(long)]
         remote: Option<String>,
 
