@@ -339,7 +339,9 @@ impl ZeroclawClient {
         struct PutEnvelope<'a> {
             content: &'a str,
         }
-        let body = PutEnvelope { content: &updated_toml };
+        let body = PutEnvelope {
+            content: &updated_toml,
+        };
 
         let url = format!("{}/api/config", self.base_url);
         let res = self
