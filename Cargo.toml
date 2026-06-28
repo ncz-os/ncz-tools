@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "zterm",
     "ncz",
 ]
 
@@ -19,7 +18,3 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
-
-# zterm prefers speed-optimized release builds; override the workspace default.
-[profile.release.package.zterm]
-opt-level = 3
