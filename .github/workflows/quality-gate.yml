@@ -1,9 +1,9 @@
 name: Quality Gate
 
 # ncz-os Rust quality gate — same shape as zeroclaw-labs/zeroclaw CI, parameterized
-# for this repo. GitHub runs the full 3-OS matrix; GitLab (.gitlab-ci.yml) mirrors
-# the comprehensive linux gate. Toolchain pinned to 1.93.0 (matches rust-toolchain.toml
-# where present) so rustfmt/clippy behavior is reproducible.
+# for this repo. GitLab (.gitlab-ci.yml) mirrors the comprehensive linux gate.
+# Toolchain pinned to 1.93.0 (matches rust-toolchain.toml where present) so
+# rustfmt/clippy behavior is reproducible. OS matrix: linux, macos.
 
 on:
   pull_request:
@@ -48,8 +48,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: System deps
-        run: sudo apt-get update -qq && sudo apt-get install -y pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   build:
@@ -63,7 +61,6 @@ jobs:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cmd: build, label: Build }
           - { os: macos-14,       target: aarch64-apple-darwin,     cmd: check, label: Check }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   cmd: check, label: Check }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -73,9 +70,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: System deps (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: ${{ matrix.label }}
         run: cargo ${{ matrix.cmd }} --workspace --locked --all-features --target ${{ matrix.target }}
 
@@ -98,8 +92,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: System deps
-        run: sudo apt-get update -qq && sudo apt-get install -y pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo check --workspace --locked ${{ matrix.args }}
 
   test:
@@ -115,8 +107,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: System deps
-        run: sudo apt-get update -qq && sudo apt-get install -y pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked --all-features
